@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use zeroize::Zeroize;
 
 use adb::{MdnsSupport, SmartSocket};
 use service::PortOwner;
@@ -246,8 +247,14 @@ fn pair_manually(endpoint: &str) -> Result<()> {
         bail!("no adb server on port {port}. Run `wadb install` first.");
     }
     // Read without echo: the code is a shared secret for the life of the dialog.
-    let code = rpassword::prompt_password("pairing code shown on the phone: ")?;
+    let mut code = rpassword::prompt_password("pairing code shown on the phone: ")?;
     let outcome = pairing::pair(&adb_path, port, endpoint, code.trim())?;
+    // The README promises the code does not linger; the prompt's own String has to go too.
+    code.zeroize();
+    let host = endpoint
+        .rsplit_once(':')
+        .map(|(h, _)| h.trim_matches(['[', ']']))
+        .unwrap_or(endpoint);
     match outcome {
         pairing::PairOutcome::Paired { guid } => {
             println!(
@@ -273,7 +280,18 @@ fn pair_manually(endpoint: &str) -> Result<()> {
         pairing::PairOutcome::Unreachable => {
             bail!("nothing answered at {endpoint} - the pairing dialog may have closed")
         }
-        pairing::PairOutcome::Other(msg) => bail!("{msg}"),
+        // Wording varies across adb 30..36, so an unrecognised line is not a failure.
+        // The QR path already falls through to a connect attempt; so must this one, or a
+        // real pairing reads as an error.
+        pairing::PairOutcome::Other(msg) => {
+            match pairing::connect_after_pair(&adb_path, port, host, None) {
+                Ok(line) => {
+                    println!("{line}");
+                    Ok(())
+                }
+                Err(_) => bail!("{msg}"),
+            }
+        }
     }
 }
 

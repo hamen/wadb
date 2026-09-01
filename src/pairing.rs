@@ -6,6 +6,7 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -281,7 +282,8 @@ pub fn connect(adb: &Path, port: u16, endpoint: &str) -> Result<String> {
     cmd.args(["connect", endpoint]);
     // A bad address blocks the worker just as effectively as a bad code.
     let (stdout, stderr, ok) = run_bounded(cmd, None, Duration::from_secs(10))?;
-    parse_connect_output(&format!("{}{}", stdout.trim(), stderr.trim()), ok)
+    let text = format!("{}\n{}", stdout.trim(), stderr.trim());
+    parse_connect_output(&text, ok)
 }
 
 /// The argv `adb pair` is invoked with. `pair` builds its command from this, so the test
@@ -313,10 +315,10 @@ pub fn run_pairing(
     port: u16,
     payload: Payload,
     timeout: Duration,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel: std::sync::Arc<AtomicBool>,
     tx: std::sync::mpsc::Sender<PairEvent>,
 ) {
-    let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+    let cancelled = || cancel.load(Ordering::Relaxed);
     let found = match crate::discovery::browse_cancellable(PAIRING_SERVICE, timeout, &cancel, |f| {
         payload.matches_instance(&f.fullname)
     }) {
@@ -355,7 +357,10 @@ pub fn run_pairing(
         let ep = endpoint(*addr, found.port);
         match pair(&adb, port, &ep, payload.password()) {
             Ok(PairOutcome::Paired { guid }) => {
-                match connect_paired(&adb, port, *addr, guid.as_deref()) {
+                if cancelled() {
+                    return;
+                }
+                match connect_paired_cancellable(&adb, port, *addr, guid.as_deref(), &cancel) {
                     Ok(msg) => {
                         let _ = tx.send(PairEvent::Connected(msg));
                     }
@@ -375,7 +380,10 @@ pub fn run_pairing(
             // worth a connect attempt: if it really failed, the connect fails too, and
             // the user sees that rather than a false "pairing failed".
             Ok(PairOutcome::Other(msg)) => {
-                if let Ok(m) = connect_paired(&adb, port, *addr, None) {
+                if cancelled() {
+                    return;
+                }
+                if let Ok(m) = connect_paired_cancellable(&adb, port, *addr, None, &cancel) {
                     let _ = tx.send(PairEvent::Connected(m));
                     return;
                 }
@@ -394,16 +402,38 @@ pub fn run_pairing(
 /// advertised instance must not end the attempt: adb's wording varies between versions,
 /// so a parsed guid can be wrong while the address is still right.
 pub fn connect_paired(adb: &Path, port: u16, host: IpAddr, guid: Option<&str>) -> Result<String> {
+    connect_paired_cancellable(adb, port, host, guid, &AtomicBool::new(false))
+}
+
+/// As above, but abandons the browse when the user cancels. Without this a cancel that
+/// lands after `adb pair` succeeded still spends up to twelve seconds browsing, and then
+/// attaches a phone the user asked us not to.
+pub fn connect_paired_cancellable(
+    adb: &Path,
+    port: u16,
+    host: IpAddr,
+    guid: Option<&str>,
+    cancel: &AtomicBool,
+) -> Result<String> {
     let mut found = None;
     if let Some(g) = guid {
-        found = crate::discovery::browse(CONNECT_SERVICE, Duration::from_secs(6), |f| {
-            f.instance() == g
-        })?;
+        found = crate::discovery::browse_cancellable(
+            CONNECT_SERVICE,
+            Duration::from_secs(6),
+            cancel,
+            |f| f.instance() == g,
+        )?;
     }
-    if found.is_none() {
-        found = crate::discovery::browse(CONNECT_SERVICE, Duration::from_secs(6), |f| {
-            f.addresses.contains(&host)
-        })?;
+    if found.is_none() && !cancel.load(Ordering::Relaxed) {
+        found = crate::discovery::browse_cancellable(
+            CONNECT_SERVICE,
+            Duration::from_secs(6),
+            cancel,
+            |f| f.addresses.contains(&host),
+        )?;
+    }
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
     }
 
     let ep = match found {
@@ -508,6 +538,22 @@ mod tests {
             "link-local is unusable, global v6 is a fallback"
         );
         assert!(!usable.iter().any(|a| a.to_string().starts_with("fe80")));
+    }
+
+    #[test]
+    fn a_cancelled_connect_does_not_attach_anything() {
+        let cancel = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        let result = connect_paired_cancellable(
+            Path::new("/nonexistent/adb"),
+            5037,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)),
+            Some("adb-XYZ"),
+            &cancel,
+        );
+        assert!(result.is_err(), "a cancelled pairing must not connect");
+        // Two 6s browses would otherwise run before it noticed.
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

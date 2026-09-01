@@ -219,10 +219,12 @@ pub fn install() -> Result<InstallReport> {
     let mdns = match adb::probe_mdns_support(&adb_path)? {
         MdnsSupport::Present(v) => v,
         MdnsSupport::Absent => bail!(
-            "{} has no mDNS backend, so adb cannot reconnect paired devices on its own.\n\
+            "{} (version {}) has no mDNS backend, so adb cannot reconnect paired devices \
+             on its own.\n\
              Install Android SDK Platform-Tools and re-run, or set $ADB to a build that has it.\n\
              Check it yourself with: ADB_SERVER_SOCKET=tcp:127.0.0.1:<scratch port> {} mdns check",
             adb_path.display(),
+            adb::version_of(&adb_path).unwrap_or_else(|| "unknown".into()),
             adb_path.display()
         ),
     };
@@ -275,12 +277,17 @@ pub fn restart() -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
-    let _ = systemctl(&["disable", "--now", UNIT_NAME]);
+    // Failing here and still deleting the unit file would leave the server we own running
+    // with nothing left to manage it.
+    if installed_unit().is_some() {
+        systemctl(&["disable", "--now", UNIT_NAME])
+            .context("could not stop the unit; the adb server it owns is still running")?;
+    }
     let path = unit_path()?;
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
-    let _ = systemctl(&["daemon-reload"]);
+    systemctl(&["daemon-reload"])?;
     Ok(())
 }
 

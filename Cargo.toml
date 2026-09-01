@@ -16,7 +16,8 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 mdns-sd = "0.14"
 qrcode = { version = "0.14", default-features = false }
-ratatui = "0.30"
+# Only the crossterm backend is used; the default set also pulls termina and termwiz.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rand = "0.9"
 rpassword = "7"
 zeroize = "1"
