@@ -85,6 +85,10 @@ impl App {
     /// Show a QR and hand the credential to a worker thread. The payload moves into the
     /// worker, so the password never lives in UI state that gets rendered or logged.
     pub fn start_pairing(&mut self, timeout_secs: u64) {
+        if self.unit == UnitState::NotInstalled {
+            self.message = "install the service first (press i)".into();
+            return;
+        }
         let Some(adb) = self.adb.clone() else {
             self.message = "no adb binary found".into();
             return;
@@ -195,6 +199,14 @@ impl App {
     /// Refresh from the adb server over the smart socket. This never runs `adb`, so it
     /// cannot start the unsupervised server it is meant to report.
     pub fn refresh(&mut self) {
+        // With no unit of ours there is nothing to report on. Reading the default port
+        // here would list a stranger's devices as though wadb were supervising them.
+        if self.unit == UnitState::NotInstalled {
+            self.server_up = false;
+            self.devices.clear();
+            self.owner = PortOwner::Nobody;
+            return;
+        }
         let sock = SmartSocket::new(self.port);
         self.server_up = sock.is_up();
         self.devices = if self.server_up {
@@ -211,7 +223,11 @@ impl App {
 /// The smallest terminal the layout fits in. Below this the panes would overlap into
 /// nonsense, so we say so instead of drawing it.
 pub const MIN_WIDTH: u16 = 78;
-pub const MIN_HEIGHT: u16 = 26;
+/// Header (3) + the pairing pane + footer (1). The QR is the tallest thing drawn and a
+/// clipped QR does not scan, so this is derived from the pane rather than guessed: an
+/// earlier value of 26 clipped four rows off the code while the guard reported the
+/// terminal was big enough.
+pub const MIN_HEIGHT: u16 = 30;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -337,7 +353,7 @@ fn render_logs(frame: &mut Frame, area: Rect, app: &App) {
     let rows = area.height.saturating_sub(2) as usize;
     let lines: Vec<Line> = if app.logs.is_empty() {
         vec![Line::from(Span::styled(
-            "nothing from the unit yet",
+            "nothing from the unit yet (a volatile journal keeps no history across reboots)",
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
@@ -416,7 +432,14 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('i') if app.unit == UnitState::NotInstalled => {
             app.message = match crate::service::install() {
-                Ok(r) => format!("installed, supervising {}", r.adb.display()),
+                // "enable --now returned 0" is not "the unit owns the port".
+                Ok(r) => match crate::service::wait_for_ownership(r.port, Duration::from_secs(5)) {
+                    PortOwner::Ours(pid) => format!("supervising {} (pid {pid})", r.adb.display()),
+                    PortOwner::Foreign | PortOwner::HeldUnknown => {
+                        "installed, but another adb server holds the port - press t".into()
+                    }
+                    PortOwner::Nobody => "installed, but the unit is not listening yet".into(),
+                },
                 Err(e) => format!("install failed: {e}"),
             };
             app.unit = crate::ui::current_unit_state();
@@ -562,6 +585,52 @@ mod tests {
             out.contains("takeover"),
             "a warning with no remedy is a dead end"
         );
+    }
+
+    #[test]
+    fn the_declared_minimum_size_actually_fits_the_qr() {
+        // MIN_HEIGHT is the number the guard trusts; if the QR is clipped at exactly that
+        // size the guard is lying and the code will not scan.
+        let mut app = app_with("");
+        app.pairing = Some(Pairing {
+            qr: crate::qr::encode(b"WIFI:T:ADB;S:studio-Ab3xK9pQr2;P:7fRt2LmNz4;;").unwrap(),
+            phase: pair::Phase::Waiting,
+            started: Instant::now(),
+            timeout: 120,
+        });
+        let out = draw(&app, MIN_WIDTH, MIN_HEIGHT);
+        assert!(!out.contains("terminal too small"));
+        // 19 half-block rows are drawn, but the outermost two rows at each end are the
+        // quiet zone and carry no glyphs, so 15 rows of the code proper must be present.
+        let glyph_rows = out.lines().filter(|l| l.contains(['█', '▀', '▄'])).count();
+        assert_eq!(glyph_rows, 15, "the code is clipped");
+        // The lines below the code are what an undersized MIN_HEIGHT eats first.
+        assert!(out.contains("waiting for a scan"));
+        assert!(
+            out.contains("Wireless debugging"),
+            "instructions were clipped"
+        );
+    }
+
+    #[test]
+    fn first_run_reads_nothing_from_a_server_that_is_not_ours() {
+        // A foreign server on the default port must not have its devices listed as though
+        // wadb were supervising them.
+        let mut app = App::new(5037, None, UnitState::NotInstalled);
+        app.devices = crate::adb::parse_devices("192.168.1.42:37219 device model:Pixel_9\n");
+        app.server_up = true;
+        app.refresh();
+        assert!(app.devices.is_empty());
+        assert!(!app.server_up);
+        assert_eq!(app.owner, PortOwner::Nobody);
+    }
+
+    #[test]
+    fn pairing_is_refused_before_anything_is_installed() {
+        let mut app = App::new(5037, None, UnitState::NotInstalled);
+        app.start_pairing(120);
+        assert!(app.pairing.is_none());
+        assert!(app.message.contains("install"));
     }
 
     #[test]

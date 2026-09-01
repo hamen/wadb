@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use zeroize::Zeroize;
 
 use adb::{MdnsSupport, SmartSocket};
 use service::PortOwner;
@@ -117,25 +116,23 @@ fn install() -> Result<()> {
         );
     }
 
-    // Report what the unit actually achieved rather than assuming `enable --now` won.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if let PortOwner::Ours(pid) = service::port_owner(report.port) {
+    // Report what the unit actually achieved rather than assuming `enable --now` won,
+    // and exit non-zero when it did not: a script that reads only the status code must
+    // not be told a foreign server is our supervision.
+    match service::wait_for_ownership(report.port, Duration::from_secs(5)) {
+        PortOwner::Ours(pid) => {
             println!("\nsupervising adb, pid {pid}");
-            return Ok(());
+            Ok(())
         }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
-    match service::port_owner(report.port) {
-        PortOwner::Foreign => println!(
-            "\nport {} is held by another adb server, so the unit is retrying.\n\
+        PortOwner::Foreign | PortOwner::HeldUnknown => bail!(
+            "port {} is held by another adb server, so the unit is retrying.\n\
              Stop that server once with `wadb takeover`, or quit whatever started it.",
             report.port
         ),
-        _ => println!("\nthe unit is not listening yet; check `systemctl --user status wadb`"),
+        PortOwner::Nobody => {
+            bail!("the unit is not listening yet; check `systemctl --user status wadb`")
+        }
     }
-    Ok(())
 }
 
 fn uninstall() -> Result<()> {
@@ -240,17 +237,26 @@ fn status() -> Result<()> {
     Ok(())
 }
 
+/// The binary to run for mutating commands: the one the unit actually supervises, so a
+/// `$ADB` or PATH win cannot drive a different adb against our server.
+fn adb_for_commands() -> Result<std::path::PathBuf> {
+    service::installed_adb()
+        .filter(|p| p.is_file())
+        .map_or_else(adb::resolve_adb, Ok)
+}
+
 fn pair_manually(endpoint: &str) -> Result<()> {
-    let adb_path = adb::resolve_adb()?;
+    let adb_path = adb_for_commands()?;
     let port = port();
     if !SmartSocket::new(port).is_up() {
         bail!("no adb server on port {port}. Run `wadb install` first.");
     }
     // Read without echo: the code is a shared secret for the life of the dialog.
-    let mut code = rpassword::prompt_password("pairing code shown on the phone: ")?;
-    let outcome = pairing::pair(&adb_path, port, endpoint, code.trim())?;
-    // The README promises the code does not linger; the prompt's own String has to go too.
-    code.zeroize();
+    // Wrapped so it is wiped even if `pair` returns early through `?`.
+    let code = pairing::Secret::new(rpassword::prompt_password(
+        "pairing code shown on the phone: ",
+    )?);
+    let outcome = pairing::pair(&adb_path, port, endpoint, code.as_str())?;
     let host = endpoint
         .rsplit_once(':')
         .map(|(h, _)| h.trim_matches(['[', ']']))
@@ -283,7 +289,12 @@ fn pair_manually(endpoint: &str) -> Result<()> {
         // Wording varies across adb 30..36, so an unrecognised line is not a failure.
         // The QR path already falls through to a connect attempt; so must this one, or a
         // real pairing reads as an error.
-        pairing::PairOutcome::Other(msg) => {
+        // Unknown wording after a successful run is not a failure: adb's phrasing varies
+        // across 30..36. Unknown wording after a *failed* run is.
+        pairing::PairOutcome::Other { ref msg, .. } => {
+            if !pairing::should_attempt_connect(&outcome) {
+                bail!("{msg}");
+            }
             match pairing::connect_after_pair(&adb_path, port, host, None) {
                 Ok(line) => {
                     println!("{line}");
@@ -297,9 +308,7 @@ fn pair_manually(endpoint: &str) -> Result<()> {
 
 fn takeover() -> Result<()> {
     let port = port();
-    let adb_path = service::installed_adb()
-        .filter(|p| p.is_file())
-        .map_or_else(adb::resolve_adb, Ok)?;
+    let adb_path = adb_for_commands()?;
     match service::port_owner(port) {
         PortOwner::Ours(pid) => {
             println!("port {port} is already ours (pid {pid}); nothing to do.");
@@ -348,7 +357,7 @@ fn tui() -> Result<()> {
     if !std::io::stdout().is_terminal() {
         return status();
     }
-    let mut app = ui::App::new(port(), adb::resolve_adb().ok(), unit_state());
+    let mut app = ui::App::new(port(), adb_for_commands().ok(), unit_state());
     app.refresh();
     ui::run(&mut app)
 }

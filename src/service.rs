@@ -32,7 +32,8 @@ pub fn parse_systemd_version(text: &str) -> Option<u32> {
 /// never use `systemd-escape`, which is for unit *names*.
 pub fn quote_exec(path: &Path) -> String {
     let s = path.display().to_string();
-    if s.contains(char::is_whitespace) {
+    // systemd also treats quotes, backslashes and specifiers specially.
+    if s.contains(char::is_whitespace) || s.contains(['"', '\\', '\'', '$', '%']) {
         format!("\"{}\"", s.replace('"', "\\\""))
     } else {
         s
@@ -264,6 +265,19 @@ pub fn install() -> Result<InstallReport> {
         lingering: lingering(),
         backoff_full: systemd.is_some_and(|v| v >= BACKOFF_MIN_SYSTEMD),
     })
+}
+
+/// Poll until the unit owns the port, or give up. Startup is not instantaneous, and
+/// "enable --now returned 0" is not the same statement as "the unit has the port".
+pub fn wait_for_ownership(port: u16, timeout: std::time::Duration) -> PortOwner {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let owner = port_owner(port);
+        if matches!(owner, PortOwner::Ours(_)) || std::time::Instant::now() > deadline {
+            return owner;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 pub fn start() -> Result<()> {

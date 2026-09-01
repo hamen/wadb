@@ -318,8 +318,11 @@ pub fn probe_mdns_support(adb: &Path) -> Result<MdnsSupport> {
 
         // openscreen needs a moment to come up; a single immediate shot can come back
         // empty for a perfectly good binary.
-        let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+        // openscreen takes a moment to come up, and the check itself has to start and
+        // connect. Too tight a budget reports a good binary as having no backend.
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
         let mut answered = None;
+        let started = std::time::Instant::now();
         while std::time::Instant::now() < deadline {
             if let Some(status) = server.0.try_wait()? {
                 last_err = Some(anyhow!(
@@ -331,16 +334,22 @@ pub fn probe_mdns_support(adb: &Path) -> Result<MdnsSupport> {
             }
             // `Command::output()` blocks forever if the child hangs, which would make the
             // 2.5s budget meaningless and freeze install and status.
+            // A check that times out is inconclusive, never evidence of absence: the
+            // whole point is to distinguish "this binary has no backend" from "this
+            // binary was slow".
             if let Ok(out) = run_with_deadline(
                 probe_check_command(adb, port).build(),
-                Duration::from_millis(1200),
+                Duration::from_millis(2500),
             ) {
                 let text = String::from_utf8_lossy(&out);
                 if let MdnsSupport::Present(v) = parse_mdns_check(&text) {
                     answered = Some(MdnsSupport::Present(v));
                     break;
                 }
-                if !text.trim().is_empty() {
+                // An empty reply from a server that is up is how the Debian build
+                // answers, so it is a real answer - but only once the server has had
+                // time to initialise.
+                if started.elapsed() > Duration::from_secs(2) {
                     answered = Some(MdnsSupport::Absent);
                 }
             }
@@ -599,8 +608,13 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
     /// Output fixtures cannot catch the defect that matters here: a probe aimed at the
     /// wrong port, or one that leaves its server running to win the bind race against the
     /// real unit.
+    /// Serialises the tests that poison the process environment: `set_var` is visible to
+    /// every other test running in parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn probe_spawns_aims_and_tears_down() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("wadb-probe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("calls.log");
