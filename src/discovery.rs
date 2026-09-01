@@ -3,6 +3,7 @@
 //! Browsing mDNS for the phone that scanned our QR.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -27,7 +28,24 @@ impl Found {
 ///
 /// The daemon is shut down on every exit path: leaving it running would hold the
 /// multicast socket and make a second pairing attempt fail.
-pub fn browse<F>(service: &str, timeout: Duration, mut accept: F) -> Result<Option<Found>>
+pub fn browse<F>(service: &str, timeout: Duration, accept: F) -> Result<Option<Found>>
+where
+    F: FnMut(&Found) -> bool,
+{
+    browse_cancellable(service, timeout, &AtomicBool::new(false), accept)
+}
+
+/// Browse until found, cancelled, or the deadline passes.
+///
+/// Cancellation has to reach the browser itself, not just the channel the UI reads: a
+/// worker left running holds the multicast socket and can still pair a phone after the
+/// user pressed Esc.
+pub fn browse_cancellable<F>(
+    service: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    mut accept: F,
+) -> Result<Option<Found>>
 where
     F: FnMut(&Found) -> bool,
 {
@@ -36,7 +54,7 @@ where
     let deadline = Instant::now() + timeout;
     let mut hit = None;
 
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(remaining.min(Duration::from_millis(500))) {
             Ok(ServiceEvent::ServiceResolved(info)) => {
@@ -85,6 +103,17 @@ mod tests {
             port: 37219,
         };
         assert_eq!(f.instance(), "studio-Ab3xK9pQr2");
+    }
+
+    #[test]
+    fn a_cancelled_browse_returns_immediately() {
+        let cancel = AtomicBool::new(true);
+        let start = Instant::now();
+        let found = browse_cancellable(PAIRING_SERVICE, Duration::from_secs(30), &cancel, |_| true)
+            .unwrap();
+        assert!(found.is_none());
+        // Without the flag reaching the loop this would block for 30 seconds.
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     /// Spike B: the browser must coexist with a running avahi-daemon, which already owns

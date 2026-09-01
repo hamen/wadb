@@ -46,7 +46,7 @@ pub fn short_serial(serial: &str) -> String {
     }
 }
 
-pub fn render(frame: &mut Frame, area: Rect, devices: &[Device], server_up: bool) {
+pub fn render(frame: &mut Frame, area: Rect, devices: &[Device], server_up: bool, installed: bool) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         " wireless devices ",
         Style::default().add_modifier(Modifier::BOLD),
@@ -60,7 +60,12 @@ pub fn render(frame: &mut Frame, area: Rect, devices: &[Device], server_up: bool
                     Style::default().fg(Color::Red),
                 )),
                 Line::from(""),
-                Line::from("press i to install the service, or s to start it"),
+                // Offering a key that is not handled in this state would be a dead end.
+                Line::from(if installed {
+                    "press s to start the service"
+                } else {
+                    "press i to install the service"
+                }),
             ]
         } else {
             vec![

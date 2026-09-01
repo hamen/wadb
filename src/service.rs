@@ -108,6 +108,21 @@ pub fn installed_unit() -> Option<String> {
     std::fs::read_to_string(unit_path().ok()?).ok()
 }
 
+/// The adb binary baked into the installed unit. `status` must re-validate *that* binary,
+/// not whatever the resolver would pick today: an SDK upgrade or a changed $ADB would
+/// otherwise report on a binary the unit is not running.
+pub fn installed_adb() -> Option<PathBuf> {
+    let unit = installed_unit()?;
+    let exec = unit.lines().find(|l| l.starts_with("ExecStart="))?;
+    let rest = exec.strip_prefix("ExecStart=")?.trim();
+    let path = if let Some(quoted) = rest.strip_prefix('"') {
+        quoted.split('"').next()?.to_string()
+    } else {
+        rest.split_whitespace().next()?.to_string()
+    };
+    Some(PathBuf::from(path))
+}
+
 /// The port the installed unit actually listens on, so status and the TUI never inspect
 /// 5037 while the unit is elsewhere.
 pub fn installed_port() -> Option<u16> {
@@ -119,27 +134,65 @@ pub fn installed_port() -> Option<u16> {
     }
 }
 
+/// Run systemctl and *check the exit status*. Ignoring it lets `install` report success
+/// after `enable --now` failed, which is the one outcome the user must never be told.
 fn systemctl(args: &[&str]) -> Result<String> {
     let out = Command::new("systemctl")
         .arg("--user")
         .args(args)
         .output()
         .context("systemctl --user is not usable; is this a systemd user session?")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "systemctl --user {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        );
+    }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Queries whose non-zero exit is a legitimate answer rather than a failure:
+/// `is-active` exits non-zero for an inactive unit, `show` for a missing one.
+fn systemctl_query(args: &[&str]) -> String {
+    Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The PID actually holding the listening socket, read from `ss`.
+///
+/// Needed because "the unit is active" and "the unit owns the port" are different
+/// statements: a client that won a restart race holds the port while the unit sits in
+/// backoff. Returns None when the owner cannot be read at all, which happens for a
+/// socket owned by another user.
+pub fn listener_pid(port: u16) -> Option<u32> {
+    let out = Command::new("ss")
+        .args(["-ltnpH", "sport", "=", &format!(":{port}")])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (_, rest) = text.split_once("pid=")?;
+    rest.split(|c: char| !c.is_ascii_digit())
+        .find(|t| !t.is_empty())?
+        .parse()
+        .ok()
+}
+
 pub fn main_pid() -> Option<u32> {
-    systemctl(&["show", UNIT_NAME, "-p", "MainPID", "--value"])
-        .ok()?
+    systemctl_query(&["show", UNIT_NAME, "-p", "MainPID", "--value"])
         .parse()
         .ok()
         .filter(|p| *p != 0)
 }
 
 pub fn is_active() -> bool {
-    systemctl(&["is-active", UNIT_NAME])
-        .map(|s| s == "active")
-        .unwrap_or(false)
+    // A non-zero exit here means "inactive", not "failed".
+    systemctl_query(&["is-active", UNIT_NAME]) == "active"
 }
 
 pub fn lingering() -> bool {
@@ -211,6 +264,16 @@ pub fn install() -> Result<InstallReport> {
     })
 }
 
+pub fn start() -> Result<()> {
+    systemctl(&["start", UNIT_NAME])?;
+    Ok(())
+}
+
+pub fn restart() -> Result<()> {
+    systemctl(&["restart", UNIT_NAME])?;
+    Ok(())
+}
+
 pub fn uninstall() -> Result<()> {
     let _ = systemctl(&["disable", "--now", UNIT_NAME]);
     let path = unit_path()?;
@@ -221,24 +284,40 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
-/// Who holds the port: us, somebody else, or nobody.
+/// Who holds the port.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PortOwner {
+    /// The listening socket belongs to our unit's main process.
     Ours(u32),
+    /// Somebody else's adb server is listening.
     Foreign,
+    /// Something is listening but the owner cannot be read, e.g. another user's socket.
+    HeldUnknown,
     Nobody,
 }
 
-pub fn port_owner(port: u16) -> PortOwner {
-    if !SmartSocket::new(port).is_up() {
+/// Decide ownership from the listening PID and the unit's MainPID.
+///
+/// Split out from the syscalls so the comparison itself is testable: "the unit is active"
+/// is not the same statement as "the unit owns the port".
+pub fn classify_owner(up: bool, listener: Option<u32>, main: Option<u32>) -> PortOwner {
+    if !up {
         return PortOwner::Nobody;
     }
-    match main_pid() {
-        // `ss` cannot read a root-owned socket's PID, so an unreadable owner degrades to
-        // "held, owner unknown" rather than a false claim of ownership.
-        Some(pid) if is_active() => PortOwner::Ours(pid),
-        _ => PortOwner::Foreign,
+    match (listener, main) {
+        (Some(l), Some(m)) if l == m => PortOwner::Ours(l),
+        (Some(_), _) => PortOwner::Foreign,
+        // An unreadable owner must not be reported as ours.
+        (None, _) => PortOwner::HeldUnknown,
     }
+}
+
+pub fn port_owner(port: u16) -> PortOwner {
+    classify_owner(
+        SmartSocket::new(port).is_up(),
+        listener_pid(port),
+        main_pid().filter(|_| is_active()),
+    )
 }
 
 #[cfg(test)]
@@ -346,6 +425,45 @@ mod tests {
             quote_exec(Path::new("/opt/my sdk/adb")),
             "\"/opt/my sdk/adb\""
         );
+    }
+
+    #[test]
+    fn reads_the_adb_path_back_out_of_a_unit() {
+        let unit = render_unit(&spec(5137, Some(257)));
+        let exec = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
+        let path = exec
+            .strip_prefix("ExecStart=")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert_eq!(path, "/opt/sdk/platform-tools/adb");
+
+        let quoted = render_unit(&UnitSpec {
+            adb: PathBuf::from("/opt/my sdk/adb"),
+            port: DEFAULT_PORT,
+            systemd: Some(257),
+        });
+        let exec = quoted
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .unwrap();
+        assert!(exec.contains("\"/opt/my sdk/adb\""));
+    }
+
+    #[test]
+    fn ownership_needs_the_listening_pid_to_match_the_unit() {
+        assert_eq!(
+            classify_owner(true, Some(42), Some(42)),
+            PortOwner::Ours(42)
+        );
+        // Active unit, but somebody else won the race for the port.
+        assert_eq!(classify_owner(true, Some(99), Some(42)), PortOwner::Foreign);
+        // A server with no unit behind it at all.
+        assert_eq!(classify_owner(true, Some(99), None), PortOwner::Foreign);
+        // Unreadable owner must never be reported as ours.
+        assert_eq!(classify_owner(true, None, Some(42)), PortOwner::HeldUnknown);
+        assert_eq!(classify_owner(false, None, None), PortOwner::Nobody);
     }
 
     #[test]
