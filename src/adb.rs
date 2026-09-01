@@ -39,6 +39,8 @@ pub struct Device {
     /// `device`, `offline`, `unauthorized`, or anything else adb reports.
     pub state: String,
     pub model: Option<String>,
+    pub product: Option<String>,
+    pub device: Option<String>,
     pub transport: Transport,
 }
 
@@ -91,30 +93,51 @@ pub fn parse_devices(text: &str) -> Vec<Device> {
             let mut parts = line.split_whitespace();
             let serial = parts.next()?.to_string();
             let state = parts.next().unwrap_or("unknown").to_string();
-            let model = parts
-                .find_map(|f| f.strip_prefix("model:"))
-                .map(str::to_string);
+            let (mut model, mut product, mut device) = (None, None, None);
+            for field in parts {
+                if let Some(v) = field.strip_prefix("model:") {
+                    model = Some(v.to_string());
+                } else if let Some(v) = field.strip_prefix("product:") {
+                    product = Some(v.to_string());
+                } else if let Some(v) = field.strip_prefix("device:") {
+                    device = Some(v.to_string());
+                }
+            }
             let transport = classify(&serial);
             Some(Device {
                 serial,
                 state,
                 model,
+                product,
+                device,
                 transport,
             })
         })
         .collect()
 }
 
+/// Identity of a phone across transports. The serials differ between an `ip:port` and an
+/// mDNS attachment, and the mDNS serial carries no address, so the hardware fields are the
+/// only thing the two rows share.
+fn identity(d: &Device) -> Option<(String, String, String)> {
+    Some((d.model.clone()?, d.product.clone()?, d.device.clone()?))
+}
+
 /// Wireless devices only, de-duplicated: a phone that shows up under both an `ip:port`
-/// serial and an mDNS serial is one phone, not two.
+/// serial and an mDNS serial after pair-then-auto-connect is one phone, not two.
+///
+/// De-duplication needs all three hardware fields to agree. Matching on the model alone
+/// would hide a second, genuinely different phone of the same kind, and a missing device
+/// is a worse failure than a duplicated one.
 pub fn wireless_devices(all: &[Device]) -> Vec<Device> {
     let mut out: Vec<Device> = Vec::new();
     for d in all.iter().filter(|d| d.transport.is_wireless()) {
-        let dup = d.host().is_some_and(|h| {
-            out.iter()
-                .any(|k| k.host().as_deref() == Some(h.as_str()) || k.serial.contains(&h))
-        });
-        if !dup {
+        let same_host = d
+            .host()
+            .is_some_and(|h| out.iter().any(|k| k.host().as_deref() == Some(h.as_str())));
+        let same_hardware =
+            identity(d).is_some_and(|id| out.iter().any(|k| identity(k).as_ref() == Some(&id)));
+        if !same_host && !same_hardware {
             out.push(d.clone());
         }
     }
@@ -464,16 +487,23 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
 
     #[test]
     fn one_phone_under_two_serials_is_one_row() {
+        // After pair-then-auto-connect adb reports the same phone twice, once per
+        // transport. The serials share nothing, so the hardware fields are the only key.
         let devices = parse_devices(
-            "192.168.1.42:37219 device model:Pixel_9\n\
-             adb-XYZ._adb-tls-connect._tcp device model:Pixel_9\n",
+            "192.168.1.42:37219 device product:raven model:Pixel_9 device:raven\n\
+             adb-XYZ._adb-tls-connect._tcp device product:raven model:Pixel_9 device:raven\n",
         );
-        // Without de-duplication the same phone is listed twice after pair-then-autoconnect.
-        assert_eq!(
-            wireless_devices(&devices).len(),
-            2,
-            "distinct serials, no shared host"
+        assert_eq!(wireless_devices(&devices).len(), 1);
+    }
+
+    #[test]
+    fn two_identical_phone_models_are_not_merged() {
+        // Model alone is not identity. Hiding a real device is worse than showing two rows.
+        let devices = parse_devices(
+            "192.168.1.42:37219 device product:raven model:Pixel_9 device:raven\n\
+             192.168.1.77:41003 device product:raven model:Pixel_9 device:oriole\n",
         );
+        assert_eq!(wireless_devices(&devices).len(), 2);
     }
 
     #[test]
@@ -547,6 +577,96 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
             SmartSocket::new(DEFAULT_PORT).is_up() == foreign_is_up,
             "probe changed the state of the real server"
         );
+    }
+
+    /// The probe's contract, exercised end to end against a fake adb.
+    ///
+    /// Output fixtures cannot catch the defect that matters here: a probe aimed at the
+    /// wrong port, or one that leaves its server running to win the bind race against the
+    /// real unit.
+    #[test]
+    fn probe_spawns_aims_and_tears_down() {
+        let dir = std::env::temp_dir().join(format!("wadb-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("calls.log");
+        let fake = dir.join("adb");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"argv: $* | socket=${{ADB_SERVER_SOCKET:-unset}} | port_env=${{ANDROID_ADB_SERVER_PORT:-unset}}\" >> {log}\n\
+                 case \"$*\" in\n\
+                 *'nodaemon server'*) echo \"server_pid: $$\" >> {log}; sleep 30 ;;\n\
+                 *'mdns check'*) echo 'mdns daemon version [Openscreen discovery 0.0.0]' ;;\n\
+                 esac\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        // Poison the environment the probe must not propagate.
+        std::env::set_var("ADB_SERVER_SOCKET", "tcp:127.0.0.1:9999");
+        std::env::set_var("ANDROID_ADB_SERVER_PORT", "9999");
+        let result = probe_mdns_support(&fake).unwrap();
+        std::env::remove_var("ADB_SERVER_SOCKET");
+        std::env::remove_var("ANDROID_ADB_SERVER_PORT");
+        assert_eq!(
+            result,
+            MdnsSupport::Present("mdns daemon version [Openscreen discovery 0.0.0]".into())
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let server_line = calls
+            .lines()
+            .find(|l| l.contains("nodaemon server"))
+            .unwrap();
+        let check_line = calls.lines().find(|l| l.contains("mdns check")).unwrap();
+
+        // The server carries no hostname in its listen spec, and neither leaked variable.
+        assert!(server_line.contains("-L tcp:"), "{server_line}");
+        assert!(
+            !server_line.contains("tcp:127.0.0.1:"),
+            "a hostname makes adb abort"
+        );
+        assert!(server_line.contains("socket=unset"), "{server_line}");
+        assert!(server_line.contains("port_env=unset"), "{server_line}");
+
+        // The check is aimed at the probe's own port, not at the inherited 9999.
+        let port: u16 = server_line
+            .split("-L tcp:")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            check_line.contains(&format!("socket=tcp:127.0.0.1:{port}")),
+            "{check_line}"
+        );
+
+        // Teardown killed that PID, and never asked a server to stop.
+        let pid: u32 = calls
+            .lines()
+            .find_map(|l| l.strip_prefix("server_pid: "))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            !calls.contains("kill-server"),
+            "must never issue a cooperative kill"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "probe server {pid} outlived the probe and would fight the real unit"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

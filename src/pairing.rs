@@ -149,7 +149,8 @@ pub enum PairOutcome {
 pub fn parse_pair_output(stdout: &str, stderr: &str, success_exit: bool) -> PairOutcome {
     let text = format!("{stdout}\n{stderr}");
     let lower = text.to_lowercase();
-    if lower.contains("successfully paired") {
+    // Both must agree. Output alone would accept a run that adb reported as failed.
+    if success_exit && lower.contains("successfully paired") {
         // adb reports it as `[guid=adb-XXXX-YYYY]`; older builds print a bare token.
         let guid = text
             .split_once("guid=")
@@ -214,11 +215,11 @@ fn run_bounded(
     .stderr(Stdio::piped());
     let mut child = cmd.spawn().context("could not run adb")?;
     if let Some(data) = stdin_data {
-        child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("no stdin pipe"))?
-            .write_all(data.as_bytes())?;
+        let mut pipe = child.stdin.take().ok_or_else(|| anyhow!("no stdin pipe"))?;
+        pipe.write_all(data.as_bytes())?;
+        // Dropping the pipe closes it. adb waits for EOF on stdin, so leaving it open
+        // turns every pairing into a timeout.
+        drop(pipe);
     }
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -252,12 +253,35 @@ pub fn pair(adb: &Path, port: u16, endpoint: &str, code: &str) -> Result<PairOut
     Ok(parse_pair_output(&stdout, &stderr, ok))
 }
 
+/// `adb connect` reports failure in its output as well as its exit status, and on some
+/// builds only in the output ("failed to connect to ..." with a zero exit).
+pub fn parse_connect_output(text: &str, success_exit: bool) -> Result<String> {
+    let trimmed = text.trim();
+    let lower = trimmed.to_lowercase();
+    if !success_exit
+        || trimmed.is_empty()
+        || lower.starts_with("failed to connect")
+        || lower.contains("cannot connect")
+        || lower.contains("connection refused")
+    {
+        bail!(
+            "{}",
+            if trimmed.is_empty() {
+                "adb connect failed"
+            } else {
+                trimmed
+            }
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
 pub fn connect(adb: &Path, port: u16, endpoint: &str) -> Result<String> {
     let mut cmd = adb_command(adb, port);
     cmd.args(["connect", endpoint]);
     // A bad address blocks the worker just as effectively as a bad code.
-    let (stdout, stderr, _) = run_bounded(cmd, None, Duration::from_secs(10))?;
-    Ok(format!("{}{}", stdout.trim(), stderr.trim()))
+    let (stdout, stderr, ok) = run_bounded(cmd, None, Duration::from_secs(10))?;
+    parse_connect_output(&format!("{}{}", stdout.trim(), stderr.trim()), ok)
 }
 
 /// The argv `adb pair` is invoked with. `pair` builds its command from this, so the test
@@ -289,9 +313,11 @@ pub fn run_pairing(
     port: u16,
     payload: Payload,
     timeout: Duration,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<PairEvent>,
 ) {
-    let found = match crate::discovery::browse(PAIRING_SERVICE, timeout, |f| {
+    let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+    let found = match crate::discovery::browse_cancellable(PAIRING_SERVICE, timeout, &cancel, |f| {
         payload.matches_instance(&f.fullname)
     }) {
         Ok(Some(f)) => f,
@@ -307,6 +333,9 @@ pub fn run_pairing(
         }
     };
 
+    if cancelled() {
+        return;
+    }
     let addresses = usable_addresses(&found.addresses);
     if addresses.is_empty() {
         let _ = tx.send(PairEvent::Failed(
@@ -318,6 +347,11 @@ pub fn run_pairing(
 
     let mut last = String::from("no usable address");
     for addr in &addresses {
+        // Checked before each attempt: pairing a phone the user has cancelled would be
+        // worse than doing nothing.
+        if cancelled() {
+            return;
+        }
         let ep = endpoint(*addr, found.port);
         match pair(&adb, port, &ep, payload.password()) {
             Ok(PairOutcome::Paired { guid }) => {
@@ -337,6 +371,16 @@ pub fn run_pairing(
                 let _ = tx.send(PairEvent::Failed("the phone rejected the code".into()));
                 return;
             }
+            // Wording varies across adb versions. A run that did not clearly fail is
+            // worth a connect attempt: if it really failed, the connect fails too, and
+            // the user sees that rather than a false "pairing failed".
+            Ok(PairOutcome::Other(msg)) => {
+                if let Ok(m) = connect_paired(&adb, port, *addr, None) {
+                    let _ = tx.send(PairEvent::Connected(m));
+                    return;
+                }
+                last = msg;
+            }
             Ok(other) => last = format!("{other:?}"),
             Err(e) => last = e.to_string(),
         }
@@ -345,14 +389,22 @@ pub fn run_pairing(
 }
 
 /// Find the connect service for the phone we just paired with, and attach it.
-fn connect_paired(adb: &Path, port: u16, host: IpAddr, guid: Option<&str>) -> Result<String> {
-    let found = crate::discovery::browse(CONNECT_SERVICE, Duration::from_secs(8), |f| {
-        match guid {
-            Some(g) => f.instance() == g,
-            // Without a guid, the phone we paired with is the one at that address.
-            None => f.addresses.contains(&host),
-        }
-    })?;
+///
+/// The guid is tried first, then the host we paired with. A guid that does not match any
+/// advertised instance must not end the attempt: adb's wording varies between versions,
+/// so a parsed guid can be wrong while the address is still right.
+pub fn connect_paired(adb: &Path, port: u16, host: IpAddr, guid: Option<&str>) -> Result<String> {
+    let mut found = None;
+    if let Some(g) = guid {
+        found = crate::discovery::browse(CONNECT_SERVICE, Duration::from_secs(6), |f| {
+            f.instance() == g
+        })?;
+    }
+    if found.is_none() {
+        found = crate::discovery::browse(CONNECT_SERVICE, Duration::from_secs(6), |f| {
+            f.addresses.contains(&host)
+        })?;
+    }
 
     let ep = match found {
         Some(f) => {
@@ -365,6 +417,14 @@ fn connect_paired(adb: &Path, port: u16, host: IpAddr, guid: Option<&str>) -> Re
         None => bail!("paired, but the phone never advertised a connect service"),
     };
     connect(adb, port, &ep)
+}
+
+/// Same, from a textual host as typed on the command line.
+pub fn connect_after_pair(adb: &Path, port: u16, host: &str, guid: Option<&str>) -> Result<String> {
+    let addr: IpAddr = host
+        .parse()
+        .with_context(|| format!("{host} is not an IP address"))?;
+    connect_paired(adb, port, addr, guid)
 }
 
 #[cfg(test)]
@@ -503,6 +563,25 @@ mod tests {
             parse_pair_output("", "adb: No pairing code provided\n", false),
             PairOutcome::Unreachable
         );
+    }
+
+    #[test]
+    fn a_nonzero_exit_is_never_a_successful_pair() {
+        // Trusting the output alone would report a run adb itself called a failure.
+        assert!(matches!(
+            parse_pair_output("Successfully paired to 10.0.0.5:41234\n", "", false),
+            PairOutcome::Other(_)
+        ));
+    }
+
+    #[test]
+    fn connect_failure_is_not_reported_as_connected() {
+        assert!(parse_connect_output("connected to 10.0.0.5:41234", true).is_ok());
+        assert!(parse_connect_output("already connected to 10.0.0.5:41234", true).is_ok());
+        // Some builds report this with a zero exit.
+        assert!(parse_connect_output("failed to connect to 10.0.0.5:41234", true).is_err());
+        assert!(parse_connect_output("connected to 10.0.0.5:41234", false).is_err());
+        assert!(parse_connect_output("", true).is_err());
     }
 
     #[test]

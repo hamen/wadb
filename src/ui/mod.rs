@@ -20,6 +20,17 @@ use crate::adb::{Device, SmartSocket};
 use crate::qr::Matrix;
 use crate::service::{self, PortOwner};
 
+/// The unit's state right now, re-read after an action changes it.
+pub fn current_unit_state() -> UnitState {
+    if crate::service::installed_unit().is_none() {
+        UnitState::NotInstalled
+    } else if crate::service::is_active() {
+        UnitState::Active
+    } else {
+        UnitState::Inactive
+    }
+}
+
 /// What the supervising unit is doing. `NotInstalled` is a real state, not an error:
 /// before the first `wadb install` there is nothing to report on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +52,8 @@ pub struct App {
     pub tick: u64,
     pub should_quit: bool,
     pair_rx: Option<std::sync::mpsc::Receiver<crate::pairing::PairEvent>>,
+    pair_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub logs: Vec<String>,
 }
 
 pub struct Pairing {
@@ -64,6 +77,8 @@ impl App {
             tick: 0,
             should_quit: false,
             pair_rx: None,
+            pair_cancel: None,
+            logs: Vec::new(),
         }
     }
 
@@ -93,11 +108,21 @@ impl App {
             }
         };
         let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
         let port = self.port;
         std::thread::spawn(move || {
-            crate::pairing::run_pairing(adb, port, payload, Duration::from_secs(timeout_secs), tx);
+            crate::pairing::run_pairing(
+                adb,
+                port,
+                payload,
+                Duration::from_secs(timeout_secs),
+                worker_cancel,
+                tx,
+            );
         });
         self.pair_rx = Some(rx);
+        self.pair_cancel = Some(cancel);
         self.message.clear();
         self.pairing = Some(Pairing {
             qr,
@@ -105,6 +130,39 @@ impl App {
             started: Instant::now(),
             timeout: timeout_secs,
         });
+    }
+
+    /// Stop a pairing in flight. Signals the worker rather than only dropping the
+    /// channel, or it would keep browsing and could still pair after a cancel.
+    pub fn cancel_pairing(&mut self) {
+        if let Some(flag) = self.pair_cancel.take() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.pairing = None;
+        self.pair_rx = None;
+    }
+
+    /// The unit's own journal, so the pane shows history from before the TUI started.
+    pub fn refresh_logs(&mut self) {
+        let out = std::process::Command::new("journalctl")
+            .args([
+                "--user",
+                "-u",
+                crate::service::UNIT_NAME,
+                "-n",
+                "40",
+                "--no-pager",
+                "-o",
+                "cat",
+            ])
+            .output();
+        if let Ok(out) = out {
+            self.logs = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_string)
+                .collect();
+        }
     }
 
     /// Drain whatever the pairing worker has reported.
@@ -124,14 +182,13 @@ impl App {
                 p.phase = phase;
             }
         }
-        if let Some(p) = &self.pairing {
-            if matches!(p.phase, pair::Phase::Waiting)
+        let timed_out = self.pairing.as_ref().is_some_and(|p| {
+            matches!(p.phase, pair::Phase::Waiting)
                 && p.started.elapsed() > Duration::from_secs(p.timeout)
-            {
-                self.message = "pairing timed out".into();
-                self.pairing = None;
-                self.pair_rx = None;
-            }
+        });
+        if timed_out {
+            self.cancel_pairing();
+            self.message = "pairing timed out".into();
         }
     }
 
@@ -173,9 +230,12 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
+        // The journal folds away while pairing: the QR needs the height more than the
+        // log does, and a clipped QR does not scan.
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(10),
+            Constraint::Min(8),
+            Constraint::Length(if app.pairing.is_some() { 0 } else { 7 }),
             Constraint::Length(1),
         ])
         .split(area);
@@ -192,7 +252,13 @@ pub fn render(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Min(30), Constraint::Length(pane)])
         .split(rows[1]);
 
-    devices::render(frame, cols[0], &app.devices, app.server_up);
+    devices::render(
+        frame,
+        cols[0],
+        &app.devices,
+        app.server_up,
+        app.unit != UnitState::NotInstalled,
+    );
     if let Some(p) = &app.pairing {
         let view = pair::PairView {
             qr: &p.qr,
@@ -203,7 +269,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         pair::render(frame, cols[1], &view, app.tick);
     }
 
-    render_footer(frame, rows[2], app);
+    if app.pairing.is_none() {
+        render_logs(frame, rows[2], app);
+    }
+    render_footer(frame, rows[3], app);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -214,6 +283,11 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             Color::Yellow,
         ),
         (_, false, _) => ("○", "adb server down".to_string(), Color::Red),
+        (_, true, PortOwner::HeldUnknown) => (
+            "▲",
+            format!("port {} is held, owner unknown", app.port),
+            Color::Yellow,
+        ),
         (_, true, PortOwner::Foreign) => (
             "▲",
             format!(
@@ -255,9 +329,51 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn render_logs(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " journal ",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    let rows = area.height.saturating_sub(2) as usize;
+    let lines: Vec<Line> = if app.logs.is_empty() {
+        vec![Line::from(Span::styled(
+            "nothing from the unit yet",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        app.logs
+            .iter()
+            .rev()
+            .take(rows)
+            .rev()
+            .map(|l| {
+                Line::from(Span::styled(
+                    l.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ))
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let keys: &[(&str, &str)] = if app.pairing.is_some() {
         &[("esc", "cancel pairing"), ("q", "quit")]
+    } else if app.unit == UnitState::NotInstalled {
+        &[
+            ("i", "install"),
+            ("p", "pair"),
+            ("r", "refresh"),
+            ("q", "quit"),
+        ]
+    } else if app.unit != UnitState::Active {
+        &[
+            ("s", "start"),
+            ("p", "pair"),
+            ("r", "refresh"),
+            ("q", "quit"),
+        ]
     } else {
         &[("p", "pair"), ("r", "refresh"), ("q", "quit")]
     };
@@ -283,9 +399,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> bool {
             true
         }
         KeyCode::Esc if app.pairing.is_some() => {
-            app.pairing = None;
-            // Dropping the receiver lets the worker finish and shut its browser down.
-            app.pair_rx = None;
+            app.cancel_pairing();
             app.message = "pairing cancelled".into();
             true
         }
@@ -295,6 +409,24 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('p') if app.pairing.is_none() => {
             app.start_pairing(120);
+            true
+        }
+        KeyCode::Char('i') if app.unit == UnitState::NotInstalled => {
+            app.message = match crate::service::install() {
+                Ok(r) => format!("installed, supervising {}", r.adb.display()),
+                Err(e) => format!("install failed: {e}"),
+            };
+            app.unit = crate::ui::current_unit_state();
+            app.refresh();
+            true
+        }
+        KeyCode::Char('s') if app.unit != UnitState::Active => {
+            app.message = match crate::service::start() {
+                Ok(()) => "unit started".into(),
+                Err(e) => format!("could not start the unit: {e}"),
+            };
+            app.unit = crate::ui::current_unit_state();
+            app.refresh();
             true
         }
         _ => false,
@@ -317,6 +449,7 @@ where
     loop {
         if last_refresh.elapsed() >= Duration::from_secs(2) {
             app.refresh();
+            app.refresh_logs();
             last_refresh = Instant::now();
         }
         app.poll_pairing();
@@ -452,6 +585,64 @@ mod tests {
             out.contains('█') || out.contains('▀'),
             "the QR must actually be drawn"
         );
+    }
+
+    #[test]
+    fn advertised_keys_are_the_keys_that_work() {
+        // The empty state used to tell users to press i and s while neither was handled.
+        let mut app = App::new(5037, None, UnitState::NotInstalled);
+        let out = draw(&app, 90, 30);
+        assert!(
+            out.contains(" i "),
+            "install key must be offered when not installed"
+        );
+        app.unit = UnitState::Inactive;
+        let out = draw(&app, 90, 30);
+        assert!(
+            out.contains(" s "),
+            "start key must be offered when inactive"
+        );
+        app.unit = UnitState::Active;
+        let out = draw(&app, 90, 30);
+        assert!(!out.contains(" i "), "nothing to install once it is active");
+    }
+
+    #[test]
+    fn journal_pane_is_shown_and_folds_away_while_pairing() {
+        let mut app = app_with("");
+        app.logs = vec!["started adb server".into()];
+        let out = draw(&app, 90, 30);
+        assert!(out.contains("journal"));
+        assert!(out.contains("started adb server"));
+
+        app.pairing = Some(Pairing {
+            qr: crate::qr::encode(b"WIFI:T:ADB;S:studio-a;P:b;;").unwrap(),
+            phase: pair::Phase::Waiting,
+            started: Instant::now(),
+            timeout: 120,
+        });
+        let out = draw(&app, 90, 30);
+        assert!(
+            !out.contains("journal"),
+            "the QR needs the height more than the log does"
+        );
+    }
+
+    #[test]
+    fn cancelling_signals_the_worker_not_just_the_channel() {
+        let mut app = app_with("");
+        app.pairing = Some(Pairing {
+            qr: crate::qr::encode(b"WIFI:T:ADB;S:studio-a;P:b;;").unwrap(),
+            phase: pair::Phase::Waiting,
+            started: Instant::now(),
+            timeout: 120,
+        });
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.pair_cancel = Some(flag.clone());
+        app.cancel_pairing();
+        // A worker that never sees this keeps browsing and can pair after the cancel.
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.pairing.is_none());
     }
 
     #[test]
