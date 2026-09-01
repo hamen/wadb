@@ -84,7 +84,9 @@ pub fn render(frame: &mut Frame, area: Rect, view: &PairView, tick: u64) {
 /// quiet zone, so it must not be added again.
 pub fn min_size(qr: &Matrix) -> (u16, u16) {
     let w = qr.width as u16 + 2;
-    let h = qr.half_block_rows().len() as u16 + 5;
+    // Rows below the code: a blank, the status line, and the instruction line, which wraps
+    // to three at this width. Plus the block's two borders.
+    let h = qr.half_block_rows().len() as u16 + 7;
     (w, h)
 }
 
@@ -99,6 +101,9 @@ mod tests {
         let (w, h) = min_size(&m);
         // 37 already includes 4 modules of quiet zone on each side; +2 for the borders.
         assert_eq!(w, 39);
-        assert_eq!(h, 24);
+        assert_eq!(
+            h, 26,
+            "19 QR rows, blank, status, 3 wrapped instruction lines, 2 borders"
+        );
     }
 }

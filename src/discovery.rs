@@ -73,7 +73,11 @@ where
         }
     }
 
-    let _ = daemon.shutdown();
+    // shutdown() returns a receiver that confirms the daemon has released its socket.
+    // Dropping it unread lets the next browse start before port 5353 is free.
+    if let Ok(rx) = daemon.shutdown() {
+        let _ = rx.recv_timeout(Duration::from_secs(2));
+    }
     Ok(hit)
 }
 

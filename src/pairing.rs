@@ -20,6 +20,24 @@ const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01
 pub const PAIRING_SERVICE: &str = "_adb-tls-pairing._tcp.local.";
 pub const CONNECT_SERVICE: &str = "_adb-tls-connect._tcp.local.";
 
+/// A secret that is wiped when it goes out of scope, including on an early `?` return.
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+    pub fn as_str(&self) -> &str {
+        self.0.trim()
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 /// A pairing credential. The password is written to a child's stdin and never appears in
 /// argv, which is world-readable through `/proc/<pid>/cmdline`.
 pub struct Payload {
@@ -142,7 +160,12 @@ pub enum PairOutcome {
     WrongCode,
     /// The phone's pairing window closed, or nothing was listening.
     Unreachable,
-    Other(String),
+    /// Unrecognised output. `success` is the child's exit status, which decides whether a
+    /// connect fallback is justified: unknown wording after a *failed* run is a failure.
+    Other {
+        msg: String,
+        success: bool,
+    },
 }
 
 /// Read `adb pair`'s result. A zero exit alone is not proof — some builds exit zero on a
@@ -185,9 +208,15 @@ pub fn parse_pair_output(stdout: &str, stderr: &str, success_exit: bool) -> Pair
     }
     if success_exit && lower.trim().is_empty() {
         // Silence with a zero exit is not success.
-        return PairOutcome::Other("adb pair said nothing".into());
+        return PairOutcome::Other {
+            msg: "adb pair said nothing".into(),
+            success: false,
+        };
     }
-    PairOutcome::Other(text.trim().to_string())
+    PairOutcome::Other {
+        msg: text.trim().to_string(),
+        success: success_exit,
+    }
 }
 
 fn adb_command(adb: &Path, port: u16) -> Command {
@@ -200,12 +229,29 @@ fn adb_command(adb: &Path, port: u16) -> Command {
     cmd
 }
 
+/// Is this outcome one the caller should follow with a connect attempt?
+///
+/// Both the QR worker and the CLI must answer this the same way, or a real pairing reads
+/// as a failure on one path and not the other.
+pub fn should_attempt_connect(outcome: &PairOutcome) -> bool {
+    matches!(
+        outcome,
+        PairOutcome::Paired { .. } | PairOutcome::Other { success: true, .. }
+    )
+}
+
 /// Run a child with a deadline, killing and reaping it on expiry so a hung adb cannot
 /// block the pairing worker.
-fn run_bounded(
+/// Run a child with a deadline *and* a cancel flag.
+///
+/// A flag the worker only reads between steps cannot stop an `adb pair` already in
+/// flight, which leaves a twenty second window where a cancelled pairing still completes.
+/// The child is killed as soon as the flag is set.
+fn run_bounded_cancellable(
     mut cmd: Command,
     stdin_data: Option<&str>,
     timeout: Duration,
+    cancel: &AtomicBool,
 ) -> Result<(String, String, bool)> {
     cmd.stdin(if stdin_data.is_some() {
         Stdio::piped()
@@ -227,6 +273,11 @@ fn run_bounded(
         if child.try_wait()?.is_some() {
             break;
         }
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("cancelled");
+        }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
@@ -244,11 +295,21 @@ fn run_bounded(
 
 /// Pair with a phone. The code goes in on stdin only.
 pub fn pair(adb: &Path, port: u16, endpoint: &str, code: &str) -> Result<PairOutcome> {
+    pair_cancellable(adb, port, endpoint, code, &AtomicBool::new(false))
+}
+
+pub fn pair_cancellable(
+    adb: &Path,
+    port: u16,
+    endpoint: &str,
+    code: &str,
+    cancel: &AtomicBool,
+) -> Result<PairOutcome> {
     let argv = pair_argv(adb, endpoint);
     let mut cmd = adb_command(adb, port);
     cmd.args(&argv[1..]);
     let mut line = format!("{code}\n");
-    let result = run_bounded(cmd, Some(&line), Duration::from_secs(20));
+    let result = run_bounded_cancellable(cmd, Some(&line), Duration::from_secs(20), cancel);
     line.zeroize();
     let (stdout, stderr, ok) = result?;
     Ok(parse_pair_output(&stdout, &stderr, ok))
@@ -277,11 +338,16 @@ pub fn parse_connect_output(text: &str, success_exit: bool) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-pub fn connect(adb: &Path, port: u16, endpoint: &str) -> Result<String> {
+pub fn connect_cancellable(
+    adb: &Path,
+    port: u16,
+    endpoint: &str,
+    cancel: &AtomicBool,
+) -> Result<String> {
     let mut cmd = adb_command(adb, port);
     cmd.args(["connect", endpoint]);
     // A bad address blocks the worker just as effectively as a bad code.
-    let (stdout, stderr, ok) = run_bounded(cmd, None, Duration::from_secs(10))?;
+    let (stdout, stderr, ok) = run_bounded_cancellable(cmd, None, Duration::from_secs(10), cancel)?;
     let text = format!("{}\n{}", stdout.trim(), stderr.trim());
     parse_connect_output(&text, ok)
 }
@@ -355,7 +421,7 @@ pub fn run_pairing(
             return;
         }
         let ep = endpoint(*addr, found.port);
-        match pair(&adb, port, &ep, payload.password()) {
+        match pair_cancellable(&adb, port, &ep, payload.password(), &cancel) {
             Ok(PairOutcome::Paired { guid }) => {
                 if cancelled() {
                     return;
@@ -379,10 +445,14 @@ pub fn run_pairing(
             // Wording varies across adb versions. A run that did not clearly fail is
             // worth a connect attempt: if it really failed, the connect fails too, and
             // the user sees that rather than a false "pairing failed".
-            Ok(PairOutcome::Other(msg)) => {
+            // Only unknown output from a *successful* run earns a connect attempt.
+            Ok(outcome @ PairOutcome::Other { .. }) if should_attempt_connect(&outcome) => {
                 if cancelled() {
                     return;
                 }
+                let PairOutcome::Other { msg, .. } = outcome else {
+                    unreachable!()
+                };
                 if let Ok(m) = connect_paired_cancellable(&adb, port, *addr, None, &cancel) {
                     let _ = tx.send(PairEvent::Connected(m));
                     return;
@@ -446,7 +516,7 @@ pub fn connect_paired_cancellable(
         }
         None => bail!("paired, but the phone never advertised a connect service"),
     };
-    connect(adb, port, &ep)
+    connect_cancellable(adb, port, &ep, cancel)
 }
 
 /// Same, from a textual host as typed on the command line.
@@ -541,6 +611,23 @@ mod tests {
     }
 
     #[test]
+    fn cli_and_qr_paths_agree_on_when_to_connect() {
+        assert!(should_attempt_connect(&PairOutcome::Paired { guid: None }));
+        // Unknown wording from a successful run: adb's phrasing varies across 30..36.
+        assert!(should_attempt_connect(&PairOutcome::Other {
+            msg: "paired ok".into(),
+            success: true
+        }));
+        // Unknown wording from a failed run must not connect.
+        assert!(!should_attempt_connect(&PairOutcome::Other {
+            msg: "something went wrong".into(),
+            success: false
+        }));
+        assert!(!should_attempt_connect(&PairOutcome::WrongCode));
+        assert!(!should_attempt_connect(&PairOutcome::Unreachable));
+    }
+
+    #[test]
     fn a_cancelled_connect_does_not_attach_anything() {
         let cancel = AtomicBool::new(true);
         let start = std::time::Instant::now();
@@ -616,7 +703,7 @@ mod tests {
         // Trusting the output alone would report a run adb itself called a failure.
         assert!(matches!(
             parse_pair_output("Successfully paired to 10.0.0.5:41234\n", "", false),
-            PairOutcome::Other(_)
+            PairOutcome::Other { .. }
         ));
     }
 
@@ -634,7 +721,7 @@ mod tests {
     fn silence_with_a_zero_exit_is_not_success() {
         assert!(matches!(
             parse_pair_output("", "", true),
-            PairOutcome::Other(_)
+            PairOutcome::Other { .. }
         ));
     }
 
@@ -642,9 +729,15 @@ mod tests {
     fn unrecognised_but_successful_output_does_not_hard_fail() {
         // Wording varies across adb 30..36; an unknown line falls through to Other for
         // the caller to fall back on a host-address match, rather than claiming failure.
+        // Success is carried through, so the caller can justify a connect attempt.
         assert!(matches!(
             parse_pair_output("paired ok, some new wording\n", "", true),
-            PairOutcome::Other(_)
+            PairOutcome::Other { success: true, .. }
+        ));
+        // The same wording after a failed run must not trigger a connect.
+        assert!(matches!(
+            parse_pair_output("paired ok, some new wording\n", "", false),
+            PairOutcome::Other { success: false, .. }
         ));
     }
 }
