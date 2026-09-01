@@ -49,14 +49,24 @@ fn random_token(len: usize) -> Result<String> {
 
 impl Payload {
     pub fn random() -> Result<Self> {
-        Ok(Self {
+        let payload = Self {
             instance: format!("{PREFIX}{}", random_token(10)?),
             password: random_token(10)?,
-        })
+        };
+        // A payload the phone cannot parse would fail as a silent no-scan.
+        if !is_valid_qr_text(&payload.qr_text()) {
+            bail!("generated an invalid pairing payload");
+        }
+        Ok(payload)
     }
 
     pub fn instance(&self) -> &str {
         &self.instance
+    }
+
+    /// Only ever handed to a child's stdin.
+    pub fn password(&self) -> &str {
+        &self.password
     }
 
     /// The string encoded into the QR the phone scans.
@@ -72,7 +82,7 @@ impl Payload {
             .split_once("._adb-tls-pairing")
             .map(|(i, _)| i)
             .unwrap_or(service_name);
-        instance == self.instance
+        instance == self.instance()
     }
 }
 
@@ -232,8 +242,9 @@ fn run_bounded(
 
 /// Pair with a phone. The code goes in on stdin only.
 pub fn pair(adb: &Path, port: u16, endpoint: &str, code: &str) -> Result<PairOutcome> {
+    let argv = pair_argv(adb, endpoint);
     let mut cmd = adb_command(adb, port);
-    cmd.args(["pair", endpoint]);
+    cmd.args(&argv[1..]);
     let mut line = format!("{code}\n");
     let result = run_bounded(cmd, Some(&line), Duration::from_secs(20));
     line.zeroize();
@@ -249,9 +260,111 @@ pub fn connect(adb: &Path, port: u16, endpoint: &str) -> Result<String> {
     Ok(format!("{}{}", stdout.trim(), stderr.trim()))
 }
 
-/// The argv `adb pair` is invoked with, exposed so tests can prove the password is not in it.
+/// The argv `adb pair` is invoked with. `pair` builds its command from this, so the test
+/// asserting the password is absent covers the command that actually runs.
 pub fn pair_argv(adb: &Path, endpoint: &str) -> Vec<PathBuf> {
     vec![adb.to_path_buf(), "pair".into(), endpoint.into()]
+}
+
+// ---------------------------------------------------------------------------
+// The pairing worker
+// ---------------------------------------------------------------------------
+
+/// What the worker reports back to the UI.
+#[derive(Debug, Clone)]
+pub enum PairEvent {
+    Found(String),
+    Connected(String),
+    Failed(String),
+}
+
+/// Browse for the phone that scanned our code, pair with it, then connect.
+///
+/// Pairing and connecting are different services on different ports, so a successful
+/// `adb pair` is not an attached device: a connect must follow, matched on the guid adb
+/// reported or on the host we paired with. Matching on the QR name would find nothing,
+/// and taking the first connect service on the LAN could attach somebody else's phone.
+pub fn run_pairing(
+    adb: PathBuf,
+    port: u16,
+    payload: Payload,
+    timeout: Duration,
+    tx: std::sync::mpsc::Sender<PairEvent>,
+) {
+    let found = match crate::discovery::browse(PAIRING_SERVICE, timeout, |f| {
+        payload.matches_instance(&f.fullname)
+    }) {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            let _ = tx.send(PairEvent::Failed(
+                "no phone scanned the code in time".into(),
+            ));
+            return;
+        }
+        Err(e) => {
+            let _ = tx.send(PairEvent::Failed(format!("mDNS discovery failed: {e}")));
+            return;
+        }
+    };
+
+    let addresses = usable_addresses(&found.addresses);
+    if addresses.is_empty() {
+        let _ = tx.send(PairEvent::Failed(
+            "phone advertised no usable address".into(),
+        ));
+        return;
+    }
+    let _ = tx.send(PairEvent::Found(addresses[0].to_string()));
+
+    let mut last = String::from("no usable address");
+    for addr in &addresses {
+        let ep = endpoint(*addr, found.port);
+        match pair(&adb, port, &ep, payload.password()) {
+            Ok(PairOutcome::Paired { guid }) => {
+                match connect_paired(&adb, port, *addr, guid.as_deref()) {
+                    Ok(msg) => {
+                        let _ = tx.send(PairEvent::Connected(msg));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(PairEvent::Failed(format!(
+                            "paired, but connect failed: {e}"
+                        )));
+                    }
+                }
+                return;
+            }
+            Ok(PairOutcome::WrongCode) => {
+                let _ = tx.send(PairEvent::Failed("the phone rejected the code".into()));
+                return;
+            }
+            Ok(other) => last = format!("{other:?}"),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    let _ = tx.send(PairEvent::Failed(last));
+}
+
+/// Find the connect service for the phone we just paired with, and attach it.
+fn connect_paired(adb: &Path, port: u16, host: IpAddr, guid: Option<&str>) -> Result<String> {
+    let found = crate::discovery::browse(CONNECT_SERVICE, Duration::from_secs(8), |f| {
+        match guid {
+            Some(g) => f.instance() == g,
+            // Without a guid, the phone we paired with is the one at that address.
+            None => f.addresses.contains(&host),
+        }
+    })?;
+
+    let ep = match found {
+        Some(f) => {
+            let addr = usable_addresses(&f.addresses)
+                .into_iter()
+                .next()
+                .unwrap_or(host);
+            endpoint(addr, f.port)
+        }
+        None => bail!("paired, but the phone never advertised a connect service"),
+    };
+    connect(adb, port, &ep)
 }
 
 #[cfg(test)]
