@@ -199,7 +199,7 @@ pub fn probe_server_command(adb: &Path, port: u16) -> ProbeCommand {
     ProbeCommand {
         program: adb.to_path_buf(),
         args: vec![
-            format!("-L"),
+            "-L".to_string(),
             format!("tcp:{port}"),
             "nodaemon".into(),
             "server".into(),
