@@ -44,17 +44,6 @@ pub struct Device {
     pub transport: Transport,
 }
 
-impl Device {
-    /// Host part of a wireless serial, used to de-duplicate one phone that appears
-    /// under both an `ip:port` and an mDNS serial.
-    pub fn host(&self) -> Option<String> {
-        match self.transport {
-            Transport::Tcp => split_host_port(&self.serial).map(|(h, _)| h.to_string()),
-            _ => None,
-        }
-    }
-}
-
 /// Split a `host:port` serial. IPv6 serials contain many colons, so split on the LAST
 /// colon, and honour the `[addr]:port` bracket form.
 pub fn split_host_port(serial: &str) -> Option<(&str, u16)> {
@@ -116,32 +105,21 @@ pub fn parse_devices(text: &str) -> Vec<Device> {
         .collect()
 }
 
-/// Identity of a phone across transports. The serials differ between an `ip:port` and an
-/// mDNS attachment, and the mDNS serial carries no address, so the hardware fields are the
-/// only thing the two rows share.
-fn identity(d: &Device) -> Option<(String, String, String)> {
-    Some((d.model.clone()?, d.product.clone()?, d.device.clone()?))
-}
-
-/// Wireless devices only, de-duplicated: a phone that shows up under both an `ip:port`
-/// serial and an mDNS serial after pair-then-auto-connect is one phone, not two.
+/// Wireless devices only.
 ///
-/// De-duplication needs all three hardware fields to agree. Matching on the model alone
-/// would hide a second, genuinely different phone of the same kind, and a missing device
-/// is a worse failure than a duplicated one.
+/// These are deliberately **not** de-duplicated. After pair-then-auto-connect one phone
+/// can appear twice, once as `ip:port` and once under its mDNS serial, and the plan asked
+/// for those to collapse into one row. They cannot be collapsed safely: the two serials
+/// share nothing, and the only fields they do share - model, product, device - identify a
+/// device *type*, not a phone. Keying on them merges two identical handsets into one row,
+/// and silently hiding a device someone is trying to debug is a worse failure than showing
+/// an extra row. The `how` column names the transport instead, so a duplicate is visible
+/// and explicable rather than invented or concealed.
 pub fn wireless_devices(all: &[Device]) -> Vec<Device> {
-    let mut out: Vec<Device> = Vec::new();
-    for d in all.iter().filter(|d| d.transport.is_wireless()) {
-        let same_host = d
-            .host()
-            .is_some_and(|h| out.iter().any(|k| k.host().as_deref() == Some(h.as_str())));
-        let same_hardware =
-            identity(d).is_some_and(|id| out.iter().any(|k| identity(k).as_ref() == Some(&id)));
-        if !same_host && !same_hardware {
-            out.push(d.clone());
-        }
-    }
-    out
+    all.iter()
+        .filter(|d| d.transport.is_wireless())
+        .cloned()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +147,17 @@ pub fn candidate_paths(env: &dyn Fn(&str) -> Option<String>, home: &Path) -> Vec
         }
     }
     out
+}
+
+/// The version string adb reports, for messages that must name what was tested.
+pub fn version_of(adb: &Path) -> Option<String> {
+    let mut cmd = Command::new(adb);
+    cmd.arg("version");
+    let out = run_with_deadline(cmd, Duration::from_secs(3)).ok()?;
+    String::from_utf8_lossy(&out)
+        .lines()
+        .find_map(|l| l.strip_prefix("Version "))
+        .map(|v| v.trim().to_string())
 }
 
 pub fn resolve_adb() -> Result<PathBuf> {
@@ -284,6 +273,24 @@ pub fn parse_mdns_check(stdout: &str) -> MdnsSupport {
     }
 }
 
+/// Run a child and read its stdout, killing and reaping it if it overruns.
+fn run_with_deadline(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>> {
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("timed out");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(child.wait_with_output()?.stdout)
+}
+
 fn free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     Ok(listener.local_addr()?.port())
@@ -322,8 +329,13 @@ pub fn probe_mdns_support(adb: &Path) -> Result<MdnsSupport> {
                 answered = None;
                 break;
             }
-            if let Ok(out) = probe_check_command(adb, port).build().output() {
-                let text = String::from_utf8_lossy(&out.stdout);
+            // `Command::output()` blocks forever if the child hangs, which would make the
+            // 2.5s budget meaningless and freeze install and status.
+            if let Ok(out) = run_with_deadline(
+                probe_check_command(adb, port).build(),
+                Duration::from_millis(1200),
+            ) {
+                let text = String::from_utf8_lossy(&out);
                 if let MdnsSupport::Present(v) = parse_mdns_check(&text) {
                     answered = Some(MdnsSupport::Present(v));
                     break;
@@ -486,22 +498,25 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
     }
 
     #[test]
-    fn one_phone_under_two_serials_is_one_row() {
-        // After pair-then-auto-connect adb reports the same phone twice, once per
-        // transport. The serials share nothing, so the hardware fields are the only key.
+    fn both_transports_of_one_phone_are_shown() {
+        // Not merged: see wireless_devices. The two serials share nothing, and the fields
+        // they do share identify a model rather than a handset.
         let devices = parse_devices(
             "192.168.1.42:37219 device product:raven model:Pixel_9 device:raven\n\
              adb-XYZ._adb-tls-connect._tcp device product:raven model:Pixel_9 device:raven\n",
         );
-        assert_eq!(wireless_devices(&devices).len(), 1);
+        let wireless = wireless_devices(&devices);
+        assert_eq!(wireless.len(), 2);
+        assert_eq!(wireless[0].transport, Transport::Tcp);
+        assert_eq!(wireless[1].transport, Transport::Mdns);
     }
 
     #[test]
-    fn two_identical_phone_models_are_not_merged() {
-        // Model alone is not identity. Hiding a real device is worse than showing two rows.
+    fn two_identical_phones_are_never_merged() {
+        // The failure a model-based key would cause: one of these disappears.
         let devices = parse_devices(
             "192.168.1.42:37219 device product:raven model:Pixel_9 device:raven\n\
-             192.168.1.77:41003 device product:raven model:Pixel_9 device:oriole\n",
+             192.168.1.77:41003 device product:raven model:Pixel_9 device:raven\n",
         );
         assert_eq!(wireless_devices(&devices).len(), 2);
     }

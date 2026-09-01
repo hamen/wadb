@@ -395,6 +395,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 pub fn handle_key(app: &mut App, code: KeyCode) -> bool {
     match code {
         KeyCode::Char('q') | KeyCode::Char('Q') => {
+            // Quitting must stop the worker too, or it keeps browsing and can pair and
+            // connect after the TUI is gone.
+            app.cancel_pairing();
             app.should_quit = true;
             true
         }
@@ -420,7 +423,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> bool {
             app.refresh();
             true
         }
-        KeyCode::Char('s') if app.unit != UnitState::Active => {
+        KeyCode::Char('s') if app.unit == UnitState::Inactive => {
             app.message = match crate::service::start() {
                 Ok(()) => "unit started".into(),
                 Err(e) => format!("could not start the unit: {e}"),
@@ -643,6 +646,32 @@ mod tests {
         // A worker that never sees this keeps browsing and can pair after the cancel.
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
         assert!(app.pairing.is_none());
+    }
+
+    #[test]
+    fn quitting_also_stops_the_pairing_worker() {
+        // Esc used to be the only path that signalled the worker, so quitting mid-pair
+        // left it browsing and able to pair after the TUI was gone.
+        let mut app = app_with("");
+        app.pairing = Some(Pairing {
+            qr: crate::qr::encode(b"WIFI:T:ADB;S:studio-a;P:b;;").unwrap(),
+            phase: pair::Phase::Waiting,
+            started: Instant::now(),
+            timeout: 120,
+        });
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.pair_cancel = Some(flag.clone());
+        handle_key(&mut app, KeyCode::Char('q'));
+        assert!(app.should_quit);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn start_key_is_offered_only_when_there_is_a_unit_to_start() {
+        let mut app = App::new(5037, None, UnitState::NotInstalled);
+        // `s` would have run `systemctl start` on a unit that does not exist.
+        handle_key(&mut app, KeyCode::Char('s'));
+        assert!(app.message.is_empty());
     }
 
     #[test]
