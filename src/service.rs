@@ -266,11 +266,31 @@ pub struct InstallReport {
     pub backoff_full: bool,
 }
 
+fn port_from_env() -> u16 {
+    std::env::var("ANDROID_ADB_SERVER_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
+
 pub fn install() -> Result<InstallReport> {
     let adb_path = adb::resolve_adb()?;
 
     // The gate. Probe the resolved binary in isolation before trusting it with the unit.
-    let mdns = match adb::probe_mdns_support(&adb_path)? {
+    // The socket that matters belongs to whichever server is running *now*, which is the
+    // currently installed unit's port - not the port we are about to install on. Checking only
+    // the target port misses a server on the old port that still owns the mDNS socket, and the
+    // probe then answers Absent underneath it.
+    // installed_port() only says what the unit file *claims*. If that unit is stopped and some
+    // other server is on the target port, checking the empty old port would probe while that
+    // server owns the mDNS socket. Use whichever port actually has something listening.
+    let target = port_from_env();
+    let holding_port = [installed_port(), Some(target)]
+        .into_iter()
+        .flatten()
+        .find(|p| adb::SmartSocket::new(*p).is_up())
+        .unwrap_or(target);
+    let mdns = match adb::mdns_support(&adb_path, holding_port)? {
         MdnsSupport::Present(v) => v,
         MdnsSupport::Absent => bail!(
             "{} (version {}) has no mDNS backend, so adb cannot reconnect paired devices \
@@ -283,10 +303,7 @@ pub fn install() -> Result<InstallReport> {
         ),
     };
 
-    let port = std::env::var("ANDROID_ADB_SERVER_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
+    let port = target;
     let systemd = systemd_version();
     let spec = UnitSpec {
         adb: adb_path.clone(),
