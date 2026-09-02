@@ -4,8 +4,8 @@ Keeps the ADB server running on Linux so paired Android phones stay available fo
 debugging, without keeping Android Studio open. Pair once by scanning a QR code in your
 terminal; after that adb reconnects the phone by itself whenever the server starts.
 
-A `systemd --user` unit supervises the standard server on `127.0.0.1:5037` and restarts it
-if anything stops it. Android Studio, the `adb` command line and every other adb client see
+Two `systemd --user` units do the work: one supervises the standard server on `127.0.0.1:5037` and
+restarts it if anything stops it, the other reconnects wireless devices when they drop. Android Studio, the `adb` command line and every other adb client see
 the same devices.
 
 ```
@@ -27,6 +27,21 @@ the same devices.
   (see below). `wadb install` checks this and refuses otherwise.
 - Your computer and phone on the same Wi-Fi network.
 - **Wireless debugging** enabled in the phone's Developer options.
+
+## Why wadb reconnects devices itself
+
+adb is supposed to do this for you: with an mDNS backend it browses `_adb-tls-connect._tcp` and
+auto-connects the services named in `$ADB_MDNS_AUTO_CONNECT`. On a machine running `avahi-daemon`,
+which owns port 5353, that discovery frequently returns nothing — while `adb mdns check` still
+reports a working daemon version. Measured on a real Pixel 8a: after `adb kill-server` the wireless
+device never came back, and `adb mdns services` stayed empty on a server that had been up for
+minutes, at an instant when both `avahi-browse` and wadb's own browser could see the phone.
+
+A compiled-in backend is not evidence that discovery works. So wadb runs a small watcher
+(`wadb-connect.service`) that browses for advertised devices itself and issues `adb connect` for
+anything missing. That is adb's own documented behaviour, performed by the only mDNS implementation
+on the host that works. `adb connect` succeeds only for a device that already trusts this host's
+key, so nobody else's phone can be attached this way.
 
 ## Why the adb build matters
 
@@ -73,6 +88,7 @@ wadb pair 192.168.1.42:37219    # ip:port from the phone's Wireless debugging sc
 | `wadb install` | probe adb, write and start the unit |
 | `wadb status` | unit, server, adb binary, mDNS discovery, devices |
 | `wadb pair <ip:port>` | pair with a typed six-digit code |
+| `wadb connect` | reconnect every advertised wireless device once, by hand |
 | `wadb takeover` | ask a foreign adb server to stop so the unit can take the port |
 | `wadb uninstall` | stop and remove the unit |
 
