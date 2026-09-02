@@ -2,10 +2,10 @@
 
 Keeps the ADB server running on Linux so paired Android phones stay available for wireless
 debugging, without keeping Android Studio open. Pair once by scanning a QR code in your
-terminal; after that adb reconnects the phone by itself whenever the server starts.
+terminal; after that wadb brings the phone back whenever the connection drops.
 
-A `systemd --user` unit supervises the standard server on `127.0.0.1:5037` and restarts it
-if anything stops it. Android Studio, the `adb` command line and every other adb client see
+Two `systemd --user` units do the work: one supervises the standard server on `127.0.0.1:5037` and
+restarts it if anything stops it, the other reconnects wireless devices when they drop. Android Studio, the `adb` command line and every other adb client see
 the same devices.
 
 ```
@@ -28,20 +28,37 @@ the same devices.
 - Your computer and phone on the same Wi-Fi network.
 - **Wireless debugging** enabled in the phone's Developer options.
 
+## Why wadb reconnects devices itself
+
+adb is supposed to do this for you: with an mDNS backend it browses `_adb-tls-connect._tcp` and
+auto-connects the services named in `$ADB_MDNS_AUTO_CONNECT`. On a machine running `avahi-daemon`,
+which owns port 5353, that discovery frequently returns nothing — while `adb mdns check` still
+reports a working daemon version. Measured on a real Pixel 8a: after `adb kill-server` the wireless
+device never came back, and `adb mdns services` stayed empty on a server that had been up for
+minutes, at an instant when both `avahi-browse` and wadb's own browser could see the phone.
+
+A compiled-in backend is not evidence that discovery works. So wadb runs a small watcher
+(`wadb-connect.service`) that browses for advertised devices itself and issues `adb connect` for
+anything missing. That is adb's own documented behaviour, performed by the only mDNS implementation
+on the host that works. `adb connect` succeeds only for a device that already trusts this host's
+key, so nobody else's phone can be attached this way.
+
 ## Why the adb build matters
 
-adb reconnects trusted wireless devices itself: it browses `_adb-tls-connect._tcp` and
-auto-connects the services named in `$ADB_MDNS_AUTO_CONNECT`. That only works if the adb
-binary was compiled with an mDNS backend, and distro builds frequently are not:
+adb is *supposed* to reconnect trusted wireless devices itself, and it needs an mDNS backend to do
+it. Distro builds frequently have none at all:
 
 | adb | `mdns check` |
 |---|---|
 | Android SDK Platform-Tools 36.0.0 | `mdns daemon version [Openscreen discovery 0.0.0]` |
 | Debian/Ubuntu `adb` 34.0.5 | *(nothing)* |
 
-Supervising a server whose adb cannot reconnect would leave you exactly where you started —
-the server comes back with zero wireless devices. So `wadb install` refuses that binary
-rather than pretending to solve the problem.
+wadb's watcher does its own discovery, so it could in principle reconnect devices even behind an
+adb with no backend at all. `wadb install` still refuses one, for a narrower reason: such a build is
+a distro package that will also be first on your `PATH`, and the moment any tool runs it while the
+supervised server is down it forks a replacement server that has no mDNS at all and takes the port.
+Refusing it keeps the server you are supervising and the `adb` your shell finds from being two
+different programs. The section above is why having the backend is not sufficient either.
 
 Checking this correctly is subtle: `adb mdns check` reports the state of whichever **server**
 answers, not of the binary you invoked. Point the Debian binary at an SDK server and it will
@@ -73,8 +90,10 @@ wadb pair 192.168.1.42:37219    # ip:port from the phone's Wireless debugging sc
 | `wadb install` | probe adb, write and start the unit |
 | `wadb status` | unit, server, adb binary, mDNS discovery, devices |
 | `wadb pair <ip:port>` | pair with a typed six-digit code |
+| `wadb connect` | reconnect every advertised wireless device once, by hand |
+| `wadb daemon` | the reconnect watcher; this is what `wadb-connect.service` runs |
 | `wadb takeover` | ask a foreign adb server to stop so the unit can take the port |
-| `wadb uninstall` | stop and remove the unit |
+| `wadb uninstall` | stop and remove both units |
 
 ## Notes and limitations
 

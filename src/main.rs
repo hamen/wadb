@@ -3,6 +3,7 @@
 //! wadb - keep the ADB server alive so paired phones stay available for wireless debugging.
 
 mod adb;
+mod daemon;
 mod discovery;
 mod pairing;
 mod qr;
@@ -31,11 +32,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Install and start the systemd --user unit that supervises the adb server.
+    /// Install and start the two systemd --user units: the server supervisor and the reconnect watcher.
     Install,
-    /// Stop and remove the unit. Never touches an adb server it does not own.
+    /// Stop and remove both units. Never touches an adb server it does not own.
     Uninstall,
-    /// Report the unit, the server, the adb binary and mDNS discovery.
+    /// Report both units, the server, the adb binary and mDNS discovery.
     Status,
     /// Pair with a phone by typing the six-digit code it shows.
     Pair {
@@ -44,6 +45,10 @@ enum Command {
     },
     /// Ask a foreign adb server to stop so the unit can take the port.
     Takeover,
+    /// Reconnect every advertised wireless device once, then exit.
+    Connect,
+    /// Run the reconnect watcher. This is what `wadb-connect.service` runs.
+    Daemon,
 }
 
 fn port() -> u16 {
@@ -69,6 +74,8 @@ fn main() -> Result<()> {
         Some(Command::Status) => status(),
         Some(Command::Pair { endpoint }) => pair_manually(&endpoint),
         Some(Command::Takeover) => takeover(),
+        Some(Command::Connect) => connect_once(),
+        Some(Command::Daemon) => daemon::run(port()),
         None => tui(),
     }
 }
@@ -153,6 +160,16 @@ fn status() -> Result<()> {
         ui::UnitState::NotInstalled => println!("unit:     not installed - run `wadb install`"),
         ui::UnitState::Active => println!("unit:     active"),
         ui::UnitState::Inactive => println!("unit:     installed but not active"),
+    }
+    if installed != ui::UnitState::NotInstalled {
+        println!(
+            "watcher:  {}",
+            if service::connect_unit_active() {
+                "active"
+            } else {
+                "NOT running - wireless devices will not come back on their own"
+            }
+        );
     }
 
     // With no unit there is nothing of ours on any port, and describing whatever else is
@@ -348,6 +365,35 @@ fn takeover() -> Result<()> {
             std::thread::sleep(Duration::from_millis(200));
         }
         println!("restarted the unit, but it has not taken the port yet.");
+    }
+    Ok(())
+}
+
+/// One pass of the watcher, by hand.
+fn connect_once() -> Result<()> {
+    let port = port();
+    if !SmartSocket::new(port).is_up() {
+        bail!("no adb server on port {port}. Run `wadb install` first.");
+    }
+    let mut failures = std::collections::HashMap::new();
+    let outcome = daemon::tick(port, &mut failures)?;
+    for line in &outcome.connected {
+        println!("{line}");
+    }
+    for line in &outcome.failed {
+        eprintln!("failed: {line}");
+    }
+    // Exiting 0 with "nothing to reconnect" after every attempt failed would be a lie to any
+    // script reading the status code.
+    if !outcome.failed.is_empty() {
+        bail!(
+            "{} of {} device(s) could not be reconnected",
+            outcome.failed.len(),
+            outcome.failed.len() + outcome.connected.len()
+        );
+    }
+    if outcome.connected.is_empty() {
+        println!("nothing to reconnect.");
     }
     Ok(())
 }
