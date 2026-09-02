@@ -156,7 +156,7 @@ impl App {
         // `-n` window is entirely its own chatter, and a `--since` window wide enough to reach
         // past it took nearly two seconds — unusable in a render loop. Two narrow queries take
         // about nine milliseconds each.
-        let mut lines: Vec<(String, String)> = Vec::new();
+        let mut lines: Vec<JournalLine> = Vec::new();
         for (unit, count) in [
             (crate::service::CONNECT_UNIT_NAME, "40"),
             (crate::service::UNIT_NAME, "200"),
@@ -178,23 +178,11 @@ impl App {
                     String::from_utf8_lossy(&out.stdout)
                         .lines()
                         .filter_map(parse_journal_line)
-                        .filter(|(_, message)| worth_showing(message)),
+                        .filter(worth_showing),
                 );
             }
         }
-        // Same timezone from one journal, so the timestamps sort lexicographically.
-        lines.sort_by(|a, b| a.0.cmp(&b.0));
-        self.logs = lines
-            .into_iter()
-            .map(|(timestamp, message)| {
-                let clock = timestamp.split('T').nth(1).unwrap_or(&timestamp);
-                format!(
-                    "{}  {}",
-                    &clock[..clock.len().min(8)],
-                    shorten_log(&message)
-                )
-            })
-            .collect();
+        self.logs = render_log_lines(lines);
     }
 
     /// Drain whatever the pairing worker has reported.
@@ -248,34 +236,94 @@ impl App {
     }
 }
 
-/// One journal line, split so it can be sorted, filtered and rendered.
+/// One journal line: when, which process wrote it, and what it said.
 ///
-/// `journalctl -o short-iso` gives `<iso-ts> <host> <unit>[<pid>]: <message>`.
-pub fn parse_journal_line(line: &str) -> Option<(String, String)> {
-    let (timestamp, rest) = line.split_once(' ')?;
-    if !timestamp.starts_with("20") {
-        return None;
-    }
-    // Strip `<host> <process>[<pid>]: `.
-    let message = rest.split_once("]: ").map(|(_, m)| m).unwrap_or(rest);
-    Some((timestamp.to_string(), message.trim().to_string()))
+/// `journalctl -o short-iso` gives `<iso-ts> <host> <process>[<pid>]: <message>`. The process name
+/// is the authoritative signal for whose line this is — keying off the message text instead means
+/// adb's own sub-tags (`D mdns : …`, from the same server) slip through, and any other line that
+/// happens to contain the word gets judged as if adb had written it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalLine {
+    pub timestamp: String,
+    pub process: String,
+    pub message: String,
 }
 
-/// Is this journal message worth a user's attention?
+pub fn parse_journal_line(line: &str) -> Option<JournalLine> {
+    let (timestamp, rest) = line.split_once(' ')?;
+    // A timestamp, not a continuation line of a multi-line entry and not journalctl's own
+    // `-- Boot … --` banners.
+    if !timestamp.starts_with(|c: char| c.is_ascii_digit()) || !timestamp.contains('T') {
+        return None;
+    }
+    let (head, message) = rest.split_once("]: ")?;
+    let process = head
+        .rsplit_once('[')
+        .map(|(name, _)| name)
+        .unwrap_or(head)
+        .rsplit(' ')
+        .next()
+        .unwrap_or(head);
+    Some(JournalLine {
+        timestamp: timestamp.to_string(),
+        process: process.to_string(),
+        message: message.trim().to_string(),
+    })
+}
+
+/// A key that orders timestamps correctly across a UTC offset change.
+///
+/// `short-iso` stamps each entry with its own offset, so a plain string sort puts `+01:00` lines
+/// before `+02:00` lines during the repeated hour of a DST fall-back. Normalising to minutes from
+/// an arbitrary epoch avoids a date-time dependency; the date part only has to be monotonic, not
+/// calendrical.
+pub fn sort_key(timestamp: &str) -> i64 {
+    let bytes: Vec<i64> = timestamp
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    let [year, month, day, hour, minute, second, ..] = bytes[..] else {
+        return 0;
+    };
+    let offset = match timestamp.rfind(['+', '-']).filter(|i| *i > 10) {
+        Some(i) => {
+            let sign = if timestamp.as_bytes()[i] == b'-' {
+                -1
+            } else {
+                1
+            };
+            let rest = &timestamp[i + 1..];
+            let h: i64 = rest.get(..2).and_then(|v| v.parse().ok()).unwrap_or(0);
+            let m: i64 = rest.get(3..5).and_then(|v| v.parse().ok()).unwrap_or(0);
+            sign * (h * 60 + m)
+        }
+        None => 0,
+    };
+    // Seconds matter: two lines in the same minute are common, and dropping them made their keys
+    // identical, so the merge fell back to whichever query happened to run first.
+    ((((year * 12 + month) * 31 + day) * 1440 + hour * 60 + minute - offset) * 60) + second
+}
+
+/// Is this line worth a user's attention?
 ///
 /// adb logs its own internals at info — transport lifecycle, libusb threads, key loading — dozens
 /// of lines per device per restart, enough that our own reconnect messages fell outside a
 /// thousand-line window entirely. Warnings and errors from adb are kept; those are worth reading.
-pub fn worth_showing(message: &str) -> bool {
-    if message.trim().is_empty() {
+/// Only lines adb itself wrote are judged this way.
+pub fn worth_showing(line: &JournalLine) -> bool {
+    if line.message.trim().is_empty() {
         return false;
     }
-    // `<pid> <tid> <level> adb : file.cpp:NN message`
-    let level = message
-        .split(" adb ")
-        .next()
-        .and_then(|head| head.rsplit(' ').find(|token| token.len() == 1));
-    !matches!(level, Some("I") | Some("D") | Some("V"))
+    if line.process != "adb" {
+        return true;
+    }
+    // `<pid> <tid> <level> <tag> : file.cpp:NN message` — the level sits at a fixed position, so
+    // this holds for adb's sub-tags too, not just lines tagged `adb`.
+    !matches!(
+        line.message.split_whitespace().nth(2),
+        Some("I") | Some("D") | Some("V")
+    )
 }
 
 /// Trim a message to what is readable in a narrow pane.
@@ -284,7 +332,9 @@ pub fn worth_showing(message: &str) -> bool {
 /// restatement of the unit description, which is the same forty characters on every line.
 pub fn shorten_log(message: &str) -> String {
     let message = match message.split_once(".cpp:") {
-        Some((_, rest)) => rest.split_once(' ').map(|(_, m)| m).unwrap_or(message),
+        // Whatever follows the line number, even if there is nothing after it. Returning the
+        // original here would keep the one thing this function exists to remove.
+        Some((_, rest)) => rest.split_once(' ').map(|(_, m)| m).unwrap_or(""),
         None => message,
     };
     match message.split_once(" - ") {
@@ -295,8 +345,22 @@ pub fn shorten_log(message: &str) -> String {
     }
 }
 
-/// The smallest terminal the layout fits in. Below this the panes would overlap into
-/// nonsense, so we say so instead of drawing it.
+/// Sort, trim and format the merged lines for the pane.
+pub fn render_log_lines(mut lines: Vec<JournalLine>) -> Vec<String> {
+    lines.sort_by_key(|l| sort_key(&l.timestamp));
+    lines
+        .into_iter()
+        .map(|l| {
+            let clock = l.timestamp.split('T').nth(1).unwrap_or(&l.timestamp);
+            format!(
+                "{}  {}",
+                &clock[..clock.len().min(8)],
+                shorten_log(&l.message)
+            )
+        })
+        .collect()
+}
+
 pub const MIN_WIDTH: u16 = 78;
 /// Header (3) + the pairing pane + footer (1). The QR is the tallest thing drawn and a
 /// clipped QR does not scan, so this is derived from the pane rather than guessed: an
@@ -754,20 +818,100 @@ mod tests {
         assert!(!out.contains(" i "), "nothing to install once it is active");
     }
 
+    fn line(process: &str, message: &str) -> JournalLine {
+        JournalLine {
+            timestamp: "2026-09-02T16:26:53+02:00".into(),
+            process: process.into(),
+            message: message.into(),
+        }
+    }
+
     #[test]
-    fn journal_lines_split_into_timestamp_and_message() {
-        let line = "2026-09-02T16:26:53+02:00 money-maker wadb[1455422]: wadb: connected to 192.168.86.45:42595";
-        let (ts, msg) = parse_journal_line(line).expect("a short-iso line parses");
-        assert_eq!(ts, "2026-09-02T16:26:53+02:00");
-        assert_eq!(msg, "wadb: connected to 192.168.86.45:42595");
-        // Anything that is not a timestamped line is ignored rather than shown raw.
+    fn journal_lines_split_into_timestamp_process_and_message() {
+        let parsed = parse_journal_line(
+            "2026-09-02T16:26:53+02:00 money-maker wadb[1455422]: wadb: connected to 192.168.86.45:42595",
+        )
+        .expect("a short-iso line parses");
+        assert_eq!(parsed.timestamp, "2026-09-02T16:26:53+02:00");
+        assert_eq!(parsed.process, "wadb", "the process is who wrote it");
+        assert_eq!(parsed.message, "wadb: connected to 192.168.86.45:42595");
+
+        // Banners and continuation lines carry no timestamp and are skipped.
         assert!(parse_journal_line("-- Boot 1a2b --").is_none());
+        assert!(parse_journal_line("    continuation of a multi-line entry").is_none());
         assert!(parse_journal_line("").is_none());
     }
 
     #[test]
+    fn adb_internal_chatter_is_filtered_out() {
+        // Real messages captured from the pane, which was five-sixths this.
+        for message in [
+            "1455377 1455377 I adb     : transport.cpp:404 BlockingConnectionAdapter(<unknown>): not started",
+            "1455377 1455377 I adb     : transport.cpp:302 BlockingConnectionAdapter(<unknown>): destructing",
+            "2726685 2726774 I adb     : usb_libusb.cpp:119 35191FDHS0003Q: write thread spawning",
+            // adb's own sub-tags: same process, different tag. Keying on the word "adb" let these
+            // through, and this tool's whole purpose makes mDNS chatter plentiful.
+            "1455377 1455377 D mdns    : mdns.cpp:120 request for service",
+            "1455377 1455377 V openscreen: discovery.cc:44 querying",
+        ] {
+            assert!(!worth_showing(&line("adb", message)), "should be filtered: {message}");
+        }
+    }
+
+    #[test]
+    fn the_lines_a_user_wants_survive() {
+        for (process, message) in [
+            ("wadb", "wadb: connected to 192.168.86.45:42595"),
+            (
+                "wadb",
+                "wadb: watching _adb-tls-connect._tcp.local. for devices to reconnect",
+            ),
+            (
+                "systemd",
+                "Started wadb.service - Keep the ADB server running (wadb).",
+            ),
+            (
+                "systemd",
+                "wadb.service: Consumed 18.196s CPU time, 6.3M memory peak.",
+            ),
+            // Not adb's line, so adb's level rules must not be applied to it: a lone I, D or V
+            // in someone else's message used to hide it.
+            ("wadb", "pairing failed: I D V adb tokens in the text"),
+        ] {
+            assert!(
+                worth_showing(&line(process, message)),
+                "should be kept: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn adb_warnings_and_errors_are_kept() {
+        for message in [
+            "1 1 W adb     : adb.cpp:100 failed to bind socket",
+            "1 1 E adb     : adb.cpp:100 could not read key",
+            "1 1 F adb     : main.cpp:167 could not install listener",
+        ] {
+            assert!(
+                worth_showing(&line("adb", message)),
+                "should be kept: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn adb_source_locations_are_stripped() {
+        assert_eq!(
+            shorten_log("1 1 W adb     : adb.cpp:100 failed to bind socket"),
+            "failed to bind socket"
+        );
+        // Nothing after the line number: the source location must still go, since removing it is
+        // the entire point of the function.
+        assert_eq!(shorten_log("1 1 W adb : adb.cpp:100"), "");
+    }
+
+    #[test]
     fn systemd_unit_descriptions_are_trimmed() {
-        // Every systemd line restates the same forty-character description.
         assert_eq!(
             shorten_log("Started wadb-connect.service - Reconnect wireless ADB devices that adb's own mDNS cannot find (wadb)."),
             "Started wadb-connect.service"
@@ -779,51 +923,42 @@ mod tests {
     }
 
     #[test]
-    fn adb_internal_chatter_is_filtered_out() {
-        // Real lines captured from the pane, which was five-sixths this.
-        let noise = [
-            "09-02 18:30:19.663 1455377 1455377 I adb     : transport.cpp:404 BlockingConnectionAdapter(<unknown>): not started",
-            "09-02 18:30:19.675 1455377 1455377 I adb     : transport.cpp:302 BlockingConnectionAdapter(<unknown>): destructing",
-            "09-01 12:53:28.419 2726685 2726774 I adb     : usb_libusb.cpp:119 35191FDHS0003Q: write thread spawning",
-            "09-01 12:53:28.599 2726685 2726685 I adb     : transport.cpp:1720 fetching keys for transport EXAMPLEDEVICE",
-            "",
+    fn the_pane_merges_both_units_in_time_order() {
+        // Two units, interleaved, arriving in the wrong order as they do from two queries.
+        let lines = vec![
+            JournalLine {
+                timestamp: "2026-09-02T16:26:53+02:00".into(),
+                process: "wadb".into(),
+                message: "wadb: connected to 192.168.86.45:42595".into(),
+            },
+            JournalLine {
+                timestamp: "2026-09-02T16:26:40+02:00".into(),
+                process: "systemd".into(),
+                message: "Started wadb-connect.service - Reconnect wireless ADB devices.".into(),
+            },
         ];
-        for line in noise {
-            assert!(!worth_showing(line), "should be filtered: {line}");
-        }
-    }
-
-    #[test]
-    fn the_lines_a_user_wants_survive() {
-        // Our own watcher output, and systemd's unit lifecycle.
-        for line in [
-            "wadb: connected to 192.168.86.45:42595",
-            "wadb: watching _adb-tls-connect._tcp.local. for devices to reconnect on port 5037",
-            "Started wadb.service - Keep the ADB server running for wireless debugging (wadb).",
-            "Stopping wadb-connect.service - Reconnect wireless ADB devices…",
-            "wadb.service: Consumed 18.196s CPU time, 6.3M memory peak.",
-        ] {
-            assert!(worth_showing(line), "should be kept: {line}");
-        }
-    }
-
-    #[test]
-    fn adb_warnings_and_errors_are_kept() {
-        // The whole point of filtering by level rather than by the word "adb".
-        for line in [
-            "09-02 18:30:19.663 1455377 1455377 W adb     : adb.cpp:100 failed to bind socket",
-            "09-02 18:30:19.663 1455377 1455377 E adb     : adb.cpp:100 could not read key",
-            "09-02 18:30:19.663 1455377 1455377 F adb     : main.cpp:167 could not install listener",
-        ] {
-            assert!(worth_showing(line), "should be kept: {line}");
-        }
-    }
-
-    #[test]
-    fn adb_source_locations_are_stripped() {
         assert_eq!(
-            shorten_log("09-02 18:30 1 1 W adb     : adb.cpp:100 failed to bind socket"),
-            "failed to bind socket"
+            render_log_lines(lines),
+            vec![
+                "16:26:40  Started wadb-connect.service".to_string(),
+                "16:26:53  wadb: connected to 192.168.86.45:42595".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn timestamps_order_correctly_across_a_utc_offset_change() {
+        // A DST fall-back repeats an hour with a different offset. 02:30+02:00 is 00:30 UTC and
+        // happened BEFORE 02:10+01:00, which is 01:10 UTC — the reverse of a string sort.
+        let earlier = "2026-10-25T02:30:00+02:00"; // 00:30 UTC
+        let later = "2026-10-25T02:10:00+01:00"; // 01:10 UTC
+        assert!(
+            later < earlier,
+            "a plain string sort would put the later entry first"
+        );
+        assert!(
+            sort_key(earlier) < sort_key(later),
+            "the sort key must reflect real time, not the printed offset"
         );
     }
 
