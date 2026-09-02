@@ -53,9 +53,12 @@ it. Distro builds frequently have none at all:
 | Android SDK Platform-Tools 36.0.0 | `mdns daemon version [Openscreen discovery 0.0.0]` |
 | Debian/Ubuntu `adb` 34.0.5 | *(nothing)* |
 
-A binary with no backend cannot discover a device under any circumstances, so `wadb install`
-refuses it rather than pretending to solve the problem. But as the section above explains, having
-the backend is not sufficient either — which is why the watcher exists.
+wadb's watcher does its own discovery, so it could in principle reconnect devices even behind an
+adb with no backend at all. `wadb install` still refuses one, for a narrower reason: such a build is
+a distro package that will also be first on your `PATH`, and the moment any tool runs it while the
+supervised server is down it forks a replacement server that has no mDNS at all and takes the port.
+Refusing it keeps the server you are supervising and the `adb` your shell finds from being two
+different programs. The section above is why having the backend is not sufficient either.
 
 Checking this correctly is subtle: `adb mdns check` reports the state of whichever **server**
 answers, not of the binary you invoked. Point the Debian binary at an SDK server and it will
@@ -88,8 +91,9 @@ wadb pair 192.168.1.42:37219    # ip:port from the phone's Wireless debugging sc
 | `wadb status` | unit, server, adb binary, mDNS discovery, devices |
 | `wadb pair <ip:port>` | pair with a typed six-digit code |
 | `wadb connect` | reconnect every advertised wireless device once, by hand |
+| `wadb daemon` | the reconnect watcher; this is what `wadb-connect.service` runs |
 | `wadb takeover` | ask a foreign adb server to stop so the unit can take the port |
-| `wadb uninstall` | stop and remove the unit |
+| `wadb uninstall` | stop and remove both units |
 
 ## Notes and limitations
 
