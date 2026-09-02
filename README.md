@@ -2,7 +2,7 @@
 
 Keeps the ADB server running on Linux so paired Android phones stay available for wireless
 debugging, without keeping Android Studio open. Pair once by scanning a QR code in your
-terminal; after that adb reconnects the phone by itself whenever the server starts.
+terminal; after that wadb brings the phone back whenever the connection drops.
 
 Two `systemd --user` units do the work: one supervises the standard server on `127.0.0.1:5037` and
 restarts it if anything stops it, the other reconnects wireless devices when they drop. Android Studio, the `adb` command line and every other adb client see
@@ -45,18 +45,17 @@ key, so nobody else's phone can be attached this way.
 
 ## Why the adb build matters
 
-adb reconnects trusted wireless devices itself: it browses `_adb-tls-connect._tcp` and
-auto-connects the services named in `$ADB_MDNS_AUTO_CONNECT`. That only works if the adb
-binary was compiled with an mDNS backend, and distro builds frequently are not:
+adb is *supposed* to reconnect trusted wireless devices itself, and it needs an mDNS backend to do
+it. Distro builds frequently have none at all:
 
 | adb | `mdns check` |
 |---|---|
 | Android SDK Platform-Tools 36.0.0 | `mdns daemon version [Openscreen discovery 0.0.0]` |
 | Debian/Ubuntu `adb` 34.0.5 | *(nothing)* |
 
-Supervising a server whose adb cannot reconnect would leave you exactly where you started —
-the server comes back with zero wireless devices. So `wadb install` refuses that binary
-rather than pretending to solve the problem.
+A binary with no backend cannot discover a device under any circumstances, so `wadb install`
+refuses it rather than pretending to solve the problem. But as the section above explains, having
+the backend is not sufficient either — which is why the watcher exists.
 
 Checking this correctly is subtle: `adb mdns check` reports the state of whichever **server**
 answers, not of the binary you invoked. Point the Debian binary at an SDK server and it will
