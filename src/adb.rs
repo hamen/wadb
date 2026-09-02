@@ -788,15 +788,25 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
 
         // Through the real entry point: a server already holding the mDNS socket must not make
         // the good binary look backend-less, which is exactly what the bare probe did.
+        // The server on the port is the SDK binary, so its answer is attributable to the SDK
+        // candidate and must be taken.
         match mdns_support(&sdk, DEFAULT_PORT).unwrap() {
             MdnsSupport::Present(v) => eprintln!("sdk adb -> {v}"),
             MdnsSupport::Absent => panic!("SDK adb has openscreen; gate reported Absent"),
         }
-        assert_eq!(
-            mdns_support(&debian, DEFAULT_PORT).unwrap(),
-            MdnsSupport::Absent,
-            "Debian adb has no mDNS backend; probe must not be fooled by a foreign server"
+
+        // The same server cannot answer for the Debian candidate, and a probe cannot take the
+        // mDNS socket while it runs — so the honest outcome is that the question is unanswerable.
+        // Asserting `Absent` here, as this test did until the invariant landed, only passed
+        // because the probe was being defeated: the right answer for the wrong reason.
+        let err = mdns_support(&debian, DEFAULT_PORT)
+            .expect_err("a live foreign-to-the-candidate server makes this unanswerable")
+            .to_string();
+        assert!(
+            err.contains("cannot be attributed"),
+            "unexpected error: {err}"
         );
+        eprintln!("debian adb -> indeterminate, as it should be while another server holds 5037");
 
         // The probe must leave nothing behind.
         assert!(
