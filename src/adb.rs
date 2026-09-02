@@ -924,7 +924,19 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
         let bin = dir.join("sleeper");
         std::fs::copy("/bin/sleep", &bin).unwrap();
 
-        let mut child = Command::new(&bin).arg("30").spawn().unwrap();
+        // Spawning a file this process just wrote can fail with ETXTBSY while another thread
+        // still holds a write descriptor to it — the copy is closed here, but a concurrent test
+        // forking inherits open descriptors, so the kernel can still see the image as busy.
+        // Retry briefly rather than making the suite order-dependent.
+        let mut child = loop {
+            match Command::new(&bin).arg("30").spawn() {
+                Ok(child) => break child,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("could not start the throwaway binary: {e}"),
+            }
+        };
         let pid = child.id();
 
         let (exe, replaced) = exe_of(pid).expect("a running child has a readable exe");
