@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use crate::adb::{self, MdnsSupport, SmartSocket, DEFAULT_PORT};
 
 pub const UNIT_NAME: &str = "wadb.service";
+pub const CONNECT_UNIT_NAME: &str = "wadb-connect.service";
 
 /// `RestartSteps` and `RestartMaxDelaySec` need systemd 254. Ubuntu 22.04 ships 249, so a
 /// lower version gets a plain fixed interval instead of a refusal: a coarser backoff is a
@@ -30,6 +31,16 @@ pub fn parse_systemd_version(text: &str) -> Option<u32> {
 
 /// systemd command lines are not shell: quote only when the path contains whitespace, and
 /// never use `systemd-escape`, which is for unit *names*.
+/// Quote a systemd directive *value* (not a command line) when it needs it.
+pub fn quote_value(path: &Path) -> String {
+    let s = path.display().to_string();
+    if s.contains(char::is_whitespace) || s.contains(['"', '\\']) {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s
+    }
+}
+
 pub fn quote_exec(path: &Path) -> String {
     let s = path.display().to_string();
     // systemd also treats quotes, backslashes and specifiers specially.
@@ -55,11 +66,7 @@ pub fn render_unit(spec: &UnitSpec) -> String {
     } else {
         format!(" -L tcp:{}", spec.port)
     };
-    let mount_dir = spec
-        .adb
-        .parent()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "/".into());
+    let mount_dir = quote_value(spec.adb.parent().unwrap_or(Path::new("/")));
 
     let backoff = match spec.systemd {
         Some(v) if v >= BACKOFF_MIN_SYSTEMD => {
@@ -96,13 +103,59 @@ WantedBy=default.target
     )
 }
 
-fn unit_path() -> Result<PathBuf> {
+/// The watcher unit.
+///
+/// It is deliberately NOT `BindsTo=wadb.service`: `adb kill-server` restarts the server unit, and
+/// `BindsTo` stops a dependent on restart without starting it again — which would kill the watcher
+/// at precisely the moment its whole job begins. `Wants=`/`After=` express the ordering without
+/// that behaviour, and the watcher waits for the server on its own anyway.
+pub fn render_connect_unit(wadb: &Path, port: u16) -> String {
+    let exec = quote_exec(wadb);
+    let mount_dir = quote_value(wadb.parent().unwrap_or(Path::new("/")));
+    format!(
+        "\
+[Unit]
+Description=Reconnect wireless ADB devices that adb's own mDNS cannot find (wadb)
+Documentation=https://github.com/hamen/wadb
+Wants={UNIT_NAME}
+After={UNIT_NAME}
+StartLimitIntervalSec=0
+RequiresMountsFor={mount_dir}
+
+[Service]
+Type=simple
+# The watcher reaches the server over its smart socket and never runs adb, so only the port
+# matters here. ExecStart is absolute: a --user unit inherits no PATH that would find it.
+Environment=ANDROID_ADB_SERVER_PORT={port}
+ExecStart={exec} daemon
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+"
+    )
+}
+
+fn unit_dir() -> Result<PathBuf> {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
         });
-    Ok(base.join("systemd/user").join(UNIT_NAME))
+    Ok(base.join("systemd/user"))
+}
+
+fn connect_unit_path() -> Result<PathBuf> {
+    Ok(unit_dir()?.join(CONNECT_UNIT_NAME))
+}
+
+pub fn connect_unit_active() -> bool {
+    systemctl_query(&["is-active", CONNECT_UNIT_NAME]) == "active"
+}
+
+fn unit_path() -> Result<PathBuf> {
+    Ok(unit_dir()?.join(UNIT_NAME))
 }
 
 pub fn installed_unit() -> Option<String> {
@@ -249,12 +302,29 @@ pub fn install() -> Result<InstallReport> {
         std::fs::write(&path, &rendered)?;
     }
 
-    systemctl(&["daemon-reload"])?;
-    systemctl(&["enable", "--now", UNIT_NAME])?;
-    // `enable --now` does not restart a unit that is already running with an older
-    // ExecStart or port.
-    if changed {
-        systemctl(&["restart", UNIT_NAME])?;
+    // The watcher runs this same binary, by absolute path: a user unit inherits no PATH that
+    // would find it.
+    let wadb = std::env::current_exe().context("could not locate the wadb binary")?;
+    // A unit pinned to a build directory dies the next time that directory is cleaned, and
+    // Restart=always then crash-loops it forever.
+    if wadb.components().any(|c| c.as_os_str() == "target") {
+        eprintln!(
+            "warning: installing from a build directory ({}).\n\
+             `cargo clean` would leave the watcher unit crash-looping. Prefer `cargo install --path .`",
+            wadb.display()
+        );
+    }
+    let connect_rendered = render_connect_unit(&wadb, port);
+    let connect_path = connect_unit_path()?;
+    let connect_changed =
+        std::fs::read_to_string(&connect_path).ok().as_deref() != Some(connect_rendered.as_str());
+    if connect_changed {
+        std::fs::write(&connect_path, &connect_rendered)?;
+    }
+
+    for step in install_steps(changed, connect_changed) {
+        let args: Vec<&str> = step.iter().map(String::as_str).collect();
+        systemctl(&args)?;
     }
 
     Ok(InstallReport {
@@ -290,18 +360,85 @@ pub fn restart() -> Result<()> {
     Ok(())
 }
 
+/// The systemctl calls an install performs, as data.
+///
+/// `enable --now` does not restart a unit that is already running with an older ExecStart or port,
+/// so a changed unit needs an explicit restart.
+pub fn install_steps(server_changed: bool, watcher_changed: bool) -> Vec<Vec<String>> {
+    let mut steps: Vec<Vec<String>> = vec![
+        vec!["daemon-reload".into()],
+        vec!["enable".into(), "--now".into(), UNIT_NAME.into()],
+        vec!["enable".into(), "--now".into(), CONNECT_UNIT_NAME.into()],
+    ];
+    if server_changed {
+        steps.push(vec!["restart".into(), UNIT_NAME.into()]);
+    }
+    if watcher_changed {
+        steps.push(vec!["restart".into(), CONNECT_UNIT_NAME.into()]);
+    }
+    steps
+}
+
+/// One action in an uninstall. Modelled as data because the *order* is what matters here, and an
+/// order is exactly what a plain sequence of calls cannot assert.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UninstallStep {
+    /// Stop and disable a unit.
+    Disable(&'static str),
+    /// Delete a unit file.
+    Remove(&'static str),
+    /// Reload systemd. Must come *after* the files are gone, or systemd keeps the definitions of
+    /// files that no longer exist.
+    Reload,
+}
+
+/// The uninstall sequence. The watcher stops first: the other order leaves it reconnecting
+/// devices to a server that is about to go away.
+pub fn uninstall_steps(watcher_installed: bool, server_installed: bool) -> Vec<UninstallStep> {
+    let mut steps = Vec::new();
+    if watcher_installed {
+        steps.push(UninstallStep::Disable(CONNECT_UNIT_NAME));
+    }
+    if server_installed {
+        steps.push(UninstallStep::Disable(UNIT_NAME));
+    }
+    if watcher_installed {
+        steps.push(UninstallStep::Remove(CONNECT_UNIT_NAME));
+    }
+    if server_installed {
+        steps.push(UninstallStep::Remove(UNIT_NAME));
+    }
+    steps.push(UninstallStep::Reload);
+    steps
+}
+
 pub fn uninstall() -> Result<()> {
-    // Failing here and still deleting the unit file would leave the server we own running
-    // with nothing left to manage it.
-    if installed_unit().is_some() {
-        systemctl(&["disable", "--now", UNIT_NAME])
-            .context("could not stop the unit; the adb server it owns is still running")?;
+    let watcher_path = connect_unit_path()?;
+    let watcher_installed = watcher_path.exists();
+    let server_installed = installed_unit().is_some();
+
+    let server_path = unit_path()?;
+    // Failing partway and still deleting a unit file would leave the server we own running with
+    // nothing left to manage it, so a disable that fails aborts the whole thing.
+    for step in uninstall_steps(watcher_installed, server_installed) {
+        match step {
+            UninstallStep::Disable(unit) => {
+                systemctl(&["disable", "--now", unit])
+                    .context("could not stop the units; the adb server may still be running")?;
+            }
+            UninstallStep::Remove(unit) => {
+                let path = if unit == CONNECT_UNIT_NAME {
+                    &watcher_path
+                } else {
+                    &server_path
+                };
+                if path.exists() {
+                    std::fs::remove_file(path)?;
+                }
+            }
+            UninstallStep::Reload => systemctl(&["daemon-reload"]).map(|_| ())?,
+        }
     }
-    let path = unit_path()?;
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
-    systemctl(&["daemon-reload"])?;
     Ok(())
 }
 
@@ -437,6 +574,84 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(port, 5137);
+    }
+
+    #[test]
+    fn install_enables_both_units_and_restarts_only_what_changed() {
+        let steps = install_steps(false, false);
+        assert!(steps.iter().any(|s| s == &["enable", "--now", UNIT_NAME]));
+        assert!(steps
+            .iter()
+            .any(|s| s == &["enable", "--now", CONNECT_UNIT_NAME]));
+        assert!(
+            !steps.iter().any(|s| s[0] == "restart"),
+            "nothing changed, nothing to restart"
+        );
+
+        let steps = install_steps(true, true);
+        assert!(steps.iter().any(|s| s == &["restart", UNIT_NAME]));
+        assert!(steps.iter().any(|s| s == &["restart", CONNECT_UNIT_NAME]));
+        assert_eq!(steps[0], ["daemon-reload"], "reload before enabling");
+    }
+
+    #[test]
+    fn uninstall_order_is_disable_then_delete_then_reload() {
+        use UninstallStep::*;
+        assert_eq!(
+            uninstall_steps(true, true),
+            vec![
+                // The watcher stops first, or it reconnects devices to a dying server.
+                Disable(CONNECT_UNIT_NAME),
+                Disable(UNIT_NAME),
+                // Files go before the reload, or systemd keeps definitions for files that are
+                // no longer on disk.
+                Remove(CONNECT_UNIT_NAME),
+                Remove(UNIT_NAME),
+                Reload,
+            ]
+        );
+        assert_eq!(uninstall_steps(false, false), vec![Reload]);
+        assert_eq!(
+            uninstall_steps(false, true),
+            vec![Disable(UNIT_NAME), Remove(UNIT_NAME), Reload]
+        );
+    }
+
+    #[test]
+    fn watcher_unit_survives_a_restart_of_the_server_unit() {
+        let unit = render_connect_unit(Path::new("/home/u/.cargo/bin/wadb"), DEFAULT_PORT);
+        // BindsTo would stop the watcher when the server unit restarts and never start it again -
+        // killing it at exactly the moment `adb kill-server` makes it necessary.
+        assert!(!unit.contains("BindsTo"));
+        assert!(unit.contains("Wants=wadb.service"));
+        assert!(unit.contains("After=wadb.service"));
+        assert!(unit.contains("Restart=always"));
+    }
+
+    #[test]
+    fn watcher_unit_runs_this_binary_by_absolute_path() {
+        // A --user unit inherits no PATH that would find `wadb`.
+        let unit = render_connect_unit(Path::new("/home/u/.cargo/bin/wadb"), 5137);
+        assert!(unit.contains("ExecStart=/home/u/.cargo/bin/wadb daemon"));
+        // And it must talk to the same port the server unit listens on.
+        assert!(unit.contains("Environment=ANDROID_ADB_SERVER_PORT=5137"));
+        assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn directive_values_are_quoted_when_they_need_it() {
+        // RequiresMountsFor= takes a value, not a command line, and was interpolated raw.
+        let unit = render_connect_unit(Path::new("/home/u/my tools/wadb"), DEFAULT_PORT);
+        assert!(
+            unit.contains("RequiresMountsFor=\"/home/u/my tools\""),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("ExecStart=\"/home/u/my tools/wadb\" daemon"),
+            "{unit}"
+        );
+        // The watcher reaches the server over the smart socket, so it needs no adb binary.
+        assert!(!unit.contains("Environment=ADB="), "{unit}");
     }
 
     #[test]

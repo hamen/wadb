@@ -390,9 +390,13 @@ impl SmartSocket {
     }
 
     fn request(&self, service: &str) -> Result<String> {
+        self.request_with_timeout(service, Duration::from_secs(3))
+    }
+
+    fn request_with_timeout(&self, service: &str, read_timeout: Duration) -> Result<String> {
         let mut stream = TcpStream::connect_timeout(&self.addr, Duration::from_millis(800))
             .with_context(|| format!("no adb server on {}", self.addr))?;
-        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.set_read_timeout(Some(read_timeout))?;
         stream.set_write_timeout(Some(Duration::from_secs(3)))?;
         write!(stream, "{:04x}{}", service.len(), service)?;
         stream.flush()?;
@@ -426,6 +430,18 @@ impl SmartSocket {
 
     pub fn devices(&self) -> Result<Vec<Device>> {
         Ok(parse_devices(&self.request("host:devices-l")?))
+    }
+
+    /// Attach a device, over the smart socket rather than by running `adb connect`.
+    ///
+    /// This is not a style preference. `adb connect` starts a server when none is listening, and
+    /// the server can stop between a liveness check and the child actually running — which forks
+    /// an unmanaged server that takes the port and locks our unit out. That failure was observed
+    /// live on this machine. A request on an already-open socket cannot start anything: if the
+    /// server is gone, the request simply fails.
+    pub fn connect_device(&self, endpoint: &str) -> Result<String> {
+        // adb blocks while it dials the phone, so this needs longer than a status query.
+        self.request_with_timeout(&format!("host:connect:{endpoint}"), Duration::from_secs(12))
     }
 
     /// What adb's own mDNS backend can currently see. A compiled-in backend is not proof
