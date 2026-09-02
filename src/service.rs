@@ -31,6 +31,16 @@ pub fn parse_systemd_version(text: &str) -> Option<u32> {
 
 /// systemd command lines are not shell: quote only when the path contains whitespace, and
 /// never use `systemd-escape`, which is for unit *names*.
+/// Quote a systemd directive *value* (not a command line) when it needs it.
+pub fn quote_value(path: &Path) -> String {
+    let s = path.display().to_string();
+    if s.contains(char::is_whitespace) || s.contains(['"', '\\']) {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s
+    }
+}
+
 pub fn quote_exec(path: &Path) -> String {
     let s = path.display().to_string();
     // systemd also treats quotes, backslashes and specifiers specially.
@@ -56,11 +66,7 @@ pub fn render_unit(spec: &UnitSpec) -> String {
     } else {
         format!(" -L tcp:{}", spec.port)
     };
-    let mount_dir = spec
-        .adb
-        .parent()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "/".into());
+    let mount_dir = quote_value(spec.adb.parent().unwrap_or(Path::new("/")));
 
     let backoff = match spec.systemd {
         Some(v) if v >= BACKOFF_MIN_SYSTEMD => {
@@ -105,11 +111,10 @@ WantedBy=default.target
 /// that behaviour, and the watcher waits for the server on its own anyway.
 pub fn render_connect_unit(wadb: &Path, adb: &Path, port: u16) -> String {
     let exec = quote_exec(wadb);
-    let adb_path = adb.display();
-    let mount_dir = wadb
-        .parent()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "/".into());
+    // Quoted like ExecStart: an unquoted path with a space would split into a garbage second
+    // assignment and the watcher would talk to a different binary than the server unit runs.
+    let adb_path = quote_value(adb);
+    let mount_dir = quote_value(wadb.parent().unwrap_or(Path::new("/")));
     format!(
         "\
 [Unit]
@@ -303,6 +308,15 @@ pub fn install() -> Result<InstallReport> {
     // The watcher runs this same binary, by absolute path: a user unit inherits no PATH that
     // would find it.
     let wadb = std::env::current_exe().context("could not locate the wadb binary")?;
+    // A unit pinned to a build directory dies the next time that directory is cleaned, and
+    // Restart=always then crash-loops it forever.
+    if wadb.components().any(|c| c.as_os_str() == "target") {
+        eprintln!(
+            "warning: installing from a build directory ({}).\n\
+             `cargo clean` would leave the watcher unit crash-looping. Prefer `cargo install --path .`",
+            wadb.display()
+        );
+    }
     let connect_rendered = render_connect_unit(&wadb, &adb_path, port);
     let connect_path = connect_unit_path()?;
     let connect_changed =
@@ -609,6 +623,24 @@ mod tests {
         // And it must talk to the same port the server unit listens on.
         assert!(unit.contains("Environment=ANDROID_ADB_SERVER_PORT=5137"));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn directive_values_are_quoted_when_they_need_it() {
+        // Environment= and RequiresMountsFor= take values, not command lines.
+        let unit = render_connect_unit(
+            Path::new("/home/u/my tools/wadb"),
+            Path::new("/opt/my sdk/adb"),
+            DEFAULT_PORT,
+        );
+        assert!(
+            unit.contains("Environment=ADB=\"/opt/my sdk/adb\""),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("RequiresMountsFor=\"/home/u/my tools\""),
+            "{unit}"
+        );
     }
 
     #[test]

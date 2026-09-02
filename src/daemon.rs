@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 
 use crate::adb::{Device, SmartSocket, Transport};
 use crate::discovery::Found;
-use crate::pairing::{connect_cancellable, endpoint, usable_addresses, CONNECT_SERVICE};
+use crate::pairing::{endpoint, parse_connect_output, usable_addresses, CONNECT_SERVICE};
 
 /// Pause between passes. A full cycle is this plus `BROWSE`.
 pub const POLL: Duration = Duration::from_secs(5);
@@ -102,7 +102,6 @@ pub fn decide(
     Action::Connect(candidates)
 }
 
-/// One pass: browse, then connect whatever is advertised and missing.
 /// What one pass did. Failures are reported, not swallowed: a caller that printed
 /// "nothing to reconnect" after every attempt failed would be lying.
 #[derive(Debug, Default)]
@@ -111,8 +110,9 @@ pub struct Outcome {
     pub failed: Vec<String>,
 }
 
+/// One pass: browse, then connect whatever is advertised and missing.
 pub fn tick(
-    adb: &Path,
+    _adb: &Path,
     port: u16,
     failures: &mut HashMap<String, (u32, Instant)>,
 ) -> Result<Outcome> {
@@ -127,35 +127,48 @@ pub fn tick(
         .devices()
         .context("could not read the device list; skipping this pass")?;
     let found = crate::discovery::browse_all(CONNECT_SERVICE, BROWSE)?;
-    // The browse takes seconds, in which the server can go away. Connecting then would spawn an
-    // unsupervised server and race the unit's restart.
-    if !sock.is_up() {
-        return Ok(Outcome::default());
-    }
+    // The browse takes seconds. Re-read the device list afterwards, or a phone that attached
+    // during the browse earns a redundant connect.
+    let devices = sock.devices().unwrap_or(devices);
 
     let mut outcome = Outcome::default();
     for service in &found {
         match decide(service, &devices, failures, Instant::now()) {
             Action::Connect(candidates) => {
-                let mut attached = false;
+                let mut errors = Vec::new();
+                let mut attached = None;
                 for ep in &candidates {
-                    let cancel = std::sync::atomic::AtomicBool::new(false);
-                    match connect_cancellable(adb, port, ep, &cancel) {
+                    // Over the smart socket: `adb connect` would fork a server if this one has
+                    // just died, which is the very failure the watcher exists to prevent.
+                    let result = sock
+                        .connect_device(ep)
+                        .and_then(|text| parse_connect_output(&text, true));
+                    match result {
                         Ok(line) => {
-                            failures.remove(ep);
-                            outcome.connected.push(line);
-                            attached = true;
+                            attached = Some(line);
                             break;
                         }
                         Err(e) => {
                             let entry = failures.entry(ep.clone()).or_insert((0, Instant::now()));
                             entry.0 += 1;
                             entry.1 = Instant::now();
-                            outcome.failed.push(format!("{ep}: {e}"));
+                            errors.push(format!("{ep}: {e}"));
                         }
                     }
                 }
-                let _ = attached;
+                match attached {
+                    // One address working means the phone is up, so nothing about it is failing:
+                    // clear every sibling endpoint, not just the one that answered, or a dead
+                    // IPv4 stays backed off while the device is healthy.
+                    Some(line) => {
+                        for a in usable_addresses(&service.addresses) {
+                            failures.remove(&endpoint(a, service.port));
+                        }
+                        outcome.connected.push(line);
+                    }
+                    // Only a service that failed on *every* address counts as a failed device.
+                    None => outcome.failed.push(errors.join("; ")),
+                }
             }
             // A device that came back by any means clears its history, or a stale streak would
             // keep it backed off after it is healthy again.
@@ -296,6 +309,26 @@ mod tests {
             ),
             Action::AlreadyAttached
         );
+    }
+
+    #[test]
+    fn an_unauthorized_device_is_left_alone_under_either_serial() {
+        for line in [
+            "192.168.86.45:42595 unauthorized model:Pixel_8a\n",
+            "adb-EXAMPLEDEVICE-a1b2c3._adb-tls-connect._tcp unauthorized model:Pixel_8a\n",
+        ] {
+            let devices = parse_devices(line);
+            assert_eq!(
+                decide(
+                    &service(vec![v4()]),
+                    &devices,
+                    &HashMap::new(),
+                    Instant::now()
+                ),
+                Action::AlreadyAttached,
+                "reconnect cannot clear an authorisation prompt: {line}"
+            );
+        }
     }
 
     #[test]
