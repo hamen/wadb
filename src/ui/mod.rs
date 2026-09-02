@@ -159,7 +159,10 @@ impl App {
         let mut lines: Vec<JournalLine> = Vec::new();
         for (unit, count) in [
             (crate::service::CONNECT_UNIT_NAME, "40"),
-            (crate::service::UNIT_NAME, "200"),
+            // adb emits over a thousand consecutive info lines under load, so a warning followed
+            // by a flood would fall outside a small window — and warnings are the only reason this
+            // unit is read at all. The measured cost is per query, not per line.
+            (crate::service::UNIT_NAME, "4000"),
         ] {
             let out = std::process::Command::new("journalctl")
                 .args([
@@ -302,9 +305,10 @@ pub fn sort_key(timestamp: &str) -> i64 {
     let (time, offset_minutes) = match rest.rfind(['+', '-']) {
         Some(i) => {
             let sign = if rest.as_bytes()[i] == b'-' { -1 } else { 1 };
-            let zone = &rest[i + 1..];
+            // `+HH:MM` and `+HHMM` are both emitted, depending on journalctl and locale.
+            let zone = rest[i + 1..].replace(':', "");
             let hours: i64 = zone.get(..2).and_then(|v| v.parse().ok()).unwrap_or(0);
-            let minutes: i64 = zone.get(3..5).and_then(|v| v.parse().ok()).unwrap_or(0);
+            let minutes: i64 = zone.get(2..4).and_then(|v| v.parse().ok()).unwrap_or(0);
             (&rest[..i], sign * (hours * 60 + minutes))
         }
         None => (rest.trim_end_matches('Z'), 0),
@@ -350,35 +354,53 @@ pub fn worth_showing(line: &JournalLine) -> bool {
     if line.process != "adb" {
         return true;
     }
-    // `<pid> <tid> <level> <tag> : file.cpp:NN message` — the level sits at a fixed position, so
-    // this holds for adb's sub-tags too, not just lines tagged `adb`.
-    !matches!(
-        line.message.split_whitespace().nth(2),
-        Some("I") | Some("D") | Some("V")
-    )
+    !matches!(adb_level(&line.message), Some("I") | Some("D") | Some("V"))
+}
+
+/// adb's log level, located by shape rather than by position.
+///
+/// The format is `<date> <time> <pid> <tid> <LEVEL> <tag> : file.cc:NN message`. A fixed field
+/// index gets this wrong — index 2 is the pid, not the level — and a filter that reads the pid
+/// keeps every line it was meant to drop. The level is instead found as the single letter directly
+/// before a tag and its colon, which holds for adb's sub-tags (`D mdns : …`) as well.
+pub fn adb_level(message: &str) -> Option<&str> {
+    let fields: Vec<&str> = message.split_whitespace().collect();
+    fields.windows(3).find_map(|w| {
+        let level = w[0];
+        (w[2] == ":" && matches!(level, "I" | "D" | "V" | "W" | "E" | "F")).then_some(level)
+    })
 }
 
 /// Trim a message to what is readable in a narrow pane.
 ///
 /// Drops adb's `file.cpp:NN` source location, of no use outside adb's own tree, and systemd's
 /// restatement of the unit description, which is the same forty characters on every line.
-pub fn shorten_log(message: &str) -> String {
-    // adb's C++ sources, and openscreen's, which log from `.cc` files.
-    let source_location = message
-        .split_once(".cpp:")
-        .or_else(|| message.split_once(".cc:"));
+pub fn shorten_log(process: &str, message: &str) -> String {
+    // Only adb writes source locations. Applying this to every process would truncate a wadb or
+    // systemd message that merely mentions a file.
+    let source_location = (process == "adb")
+        .then(|| {
+            message
+                .split_once(".cpp:")
+                .or_else(|| message.split_once(".cc:"))
+        })
+        .flatten();
+    // A warning must not render like an info line once its level is stripped.
+    let marker = match adb_level(message) {
+        Some(level @ ("W" | "E" | "F")) if process == "adb" => format!("{level}: "),
+        _ => String::new(),
+    };
     let message = match source_location {
         // Whatever follows the line number, even if there is nothing after it. Returning the
         // original here would keep the one thing this function exists to remove.
         Some((_, rest)) => rest.split_once(' ').map(|(_, m)| m).unwrap_or(""),
         None => message,
     };
-    match message.split_once(" - ") {
-        Some((head, _)) if head.ends_with(".service") || head.contains(".service:") => {
-            head.to_string()
-        }
-        _ => message.trim().to_string(),
-    }
+    let body = match message.split_once(" - ") {
+        Some((head, _)) if head.ends_with(".service") || head.contains(".service:") => head,
+        _ => message.trim(),
+    };
+    format!("{marker}{body}")
 }
 
 /// Sort, trim and format the merged lines for the pane.
@@ -391,12 +413,14 @@ pub fn render_log_lines(mut lines: Vec<JournalLine>) -> Vec<String> {
             format!(
                 "{}  {}",
                 &clock[..clock.len().min(8)],
-                shorten_log(&l.message)
+                shorten_log(&l.process, &l.message)
             )
         })
         .collect()
 }
 
+/// The smallest terminal the layout fits in. Below this the panes would overlap into nonsense,
+/// so the guard says so instead of drawing it.
 pub const MIN_WIDTH: u16 = 78;
 /// Header (3) + the pairing pane + footer (1). The QR is the tallest thing drawn and a
 /// clipped QR does not scan, so this is derived from the pane rather than guessed: an
@@ -881,14 +905,17 @@ mod tests {
     #[test]
     fn adb_internal_chatter_is_filtered_out() {
         // Real messages captured from the pane, which was five-sixths this.
+        // Copied verbatim from the live journal, adb's own date and time prefix included. The
+        // previous fixtures omitted that prefix, which is why they passed against a filter that
+        // read the pid as the level and kept every line it was meant to drop.
         for message in [
-            "1455377 1455377 I adb     : transport.cpp:404 BlockingConnectionAdapter(<unknown>): not started",
-            "1455377 1455377 I adb     : transport.cpp:302 BlockingConnectionAdapter(<unknown>): destructing",
-            "2726685 2726774 I adb     : usb_libusb.cpp:119 35191FDHS0003Q: write thread spawning",
+            "09-02 19:18:23.376 1455377 1455377 I adb     : transport.cpp:404 BlockingConnectionAdapter(<unknown>): not started",
+            "09-02 18:30:19.675 1455377 1455377 I adb     : transport.cpp:302 BlockingConnectionAdapter(<unknown>): destructing",
+            "09-01 12:53:28.419 2726685 2726774 I adb     : usb_libusb.cpp:119 35191FDHS0003Q: write thread spawning",
             // adb's own sub-tags: same process, different tag. Keying on the word "adb" let these
             // through, and this tool's whole purpose makes mDNS chatter plentiful.
-            "1455377 1455377 D mdns    : mdns.cpp:120 request for service",
-            "1455377 1455377 V openscreen: discovery.cc:44 querying",
+            "09-02 19:18:23.376 1455377 1455377 D mdns    : mdns.cpp:120 request for service",
+            "09-02 19:18:23.376 1455377 1455377 V openscreen : discovery.cc:44 querying",
         ] {
             assert!(!worth_showing(&line("adb", message)), "should be filtered: {message}");
         }
@@ -924,9 +951,9 @@ mod tests {
     #[test]
     fn adb_warnings_and_errors_are_kept() {
         for message in [
-            "1 1 W adb     : adb.cpp:100 failed to bind socket",
-            "1 1 E adb     : adb.cpp:100 could not read key",
-            "1 1 F adb     : main.cpp:167 could not install listener",
+            "09-02 19:18:23.376 1 1 W adb     : adb.cpp:100 failed to bind socket",
+            "09-02 19:18:23.376 1 1 E adb     : adb.cpp:100 could not read key",
+            "09-02 19:18:23.376 1 1 F adb     : main.cpp:167 could not install listener",
         ] {
             assert!(
                 worth_showing(&line("adb", message)),
@@ -938,27 +965,42 @@ mod tests {
     #[test]
     fn adb_source_locations_are_stripped() {
         assert_eq!(
-            shorten_log("1 1 W adb     : adb.cpp:100 failed to bind socket"),
-            "failed to bind socket"
+            shorten_log(
+                "adb",
+                "09-02 19:18 1 1 W adb     : adb.cpp:100 failed to bind socket"
+            ),
+            "W: failed to bind socket",
+            "a warning must not read like an info line once its level is stripped"
         );
         // Nothing after the line number: the source location must still go, since removing it is
         // the entire point of the function.
-        assert_eq!(shorten_log("1 1 W adb : adb.cpp:100"), "");
+        assert_eq!(
+            shorten_log("adb", "09-02 19:18 1 1 W adb : adb.cpp:100"),
+            "W: "
+        );
         // openscreen logs from .cc files, and its warnings would have kept the path.
         assert_eq!(
-            shorten_log("1 1 W openscreen: discovery.cc:44 mdns socket unavailable"),
-            "mdns socket unavailable"
+            shorten_log(
+                "adb",
+                "09-02 19:18 1 1 W openscreen : discovery.cc:44 mdns socket unavailable"
+            ),
+            "W: mdns socket unavailable"
+        );
+        // Another process mentioning a source file keeps its whole message.
+        assert_eq!(
+            shorten_log("wadb", "wadb: parsed foo.cc:12 from the manifest"),
+            "wadb: parsed foo.cc:12 from the manifest"
         );
     }
 
     #[test]
     fn systemd_unit_descriptions_are_trimmed() {
         assert_eq!(
-            shorten_log("Started wadb-connect.service - Reconnect wireless ADB devices that adb's own mDNS cannot find (wadb)."),
+            shorten_log("systemd", "Started wadb-connect.service - Reconnect wireless ADB devices that adb's own mDNS cannot find (wadb)."),
             "Started wadb-connect.service"
         );
         assert_eq!(
-            shorten_log("wadb: connected to 192.168.86.45:42595"),
+            shorten_log("wadb", "wadb: connected to 192.168.86.45:42595"),
             "wadb: connected to 192.168.86.45:42595"
         );
     }
@@ -1010,6 +1052,76 @@ mod tests {
         let rendered = render_log_lines(lines);
         assert!(rendered[0].contains("Started"), "got {rendered:?}");
         assert!(rendered[1].contains("connected"), "got {rendered:?}");
+    }
+
+    /// Runs the real pane against this machine's journal.
+    ///
+    /// The unit tests are only as good as their fixtures, and this filter shipped a version that
+    /// did nothing because the fixtures omitted adb's own date and time prefix. This one cannot be
+    /// fooled that way: whatever the journal actually holds, no adb info line may reach the pane.
+    #[test]
+    #[ignore = "reads the live journal; run with --ignored"]
+    fn the_live_pane_contains_no_adb_chatter() {
+        let mut app = App::new(5037, None, UnitState::Active);
+        app.refresh_logs();
+        eprintln!("pane has {} lines", app.logs.len());
+        for line in app.logs.iter().rev().take(5) {
+            eprintln!("  {line}");
+        }
+        for line in &app.logs {
+            assert!(
+                !line.contains("BlockingConnectionAdapter"),
+                "adb chatter reached the pane: {line}"
+            );
+            assert!(
+                !line.contains(" I adb "),
+                "an adb info line reached the pane: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_level_is_found_by_shape_not_position() {
+        // Field 2 is the pid. A fixed index read it as the level and kept every info line.
+        let live = "09-02 19:18:23.376 1455377 1455377 I adb     : transport.cpp:404 not started";
+        assert_eq!(
+            live.split_whitespace().nth(2),
+            Some("1455377"),
+            "field 2 is the pid"
+        );
+        assert_eq!(adb_level(live), Some("I"));
+        assert_eq!(adb_level("09-02 19:18 1 1 W adb : adb.cpp:1 x"), Some("W"));
+        assert_eq!(adb_level("wadb: connected to 192.168.86.45:42595"), None);
+    }
+
+    #[test]
+    fn offsets_parse_with_or_without_a_colon() {
+        // journalctl emits either shape depending on version and locale.
+        assert_eq!(
+            sort_key("2026-09-02T16:26:53.000000+05:30"),
+            sort_key("2026-09-02T16:26:53.000000+0530")
+        );
+        // A half-hour zone really is half an hour off a whole one.
+        assert_eq!(
+            sort_key("2026-09-02T16:26:53.000000+05:00")
+                - sort_key("2026-09-02T16:26:53.000000+05:30"),
+            30 * 60 * 1_000_000
+        );
+    }
+
+    #[test]
+    fn negative_offsets_and_zulu_are_handled() {
+        // Most of North America emits -HH:MM, and the sign branch is one character of logic.
+        assert_eq!(
+            sort_key("2026-09-02T12:00:00.000000-05:00"),
+            sort_key("2026-09-02T17:00:00.000000+00:00"),
+            "noon in New York is 17:00 UTC"
+        );
+        assert_eq!(
+            sort_key("2026-09-02T17:00:00.000000Z"),
+            sort_key("2026-09-02T17:00:00.000000+00:00"),
+            "a Z suffix is UTC"
+        );
     }
 
     #[test]
