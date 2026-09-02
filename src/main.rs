@@ -199,7 +199,7 @@ fn status() -> Result<()> {
     match service::installed_adb() {
         Some(path) if path.is_file() => {
             println!("adb:      {}", path.display());
-            match adb::probe_mdns_support(&path) {
+            match adb::mdns_support(&path, port) {
                 Ok(MdnsSupport::Present(v)) => println!("mdns:     {v}"),
                 Ok(MdnsSupport::Absent) => println!(
                     "mdns:     MISSING - this adb cannot reconnect devices on its own; re-run `wadb install`"
