@@ -373,28 +373,37 @@ pub fn mdns_support(adb: &Path, port: u16) -> Result<MdnsSupport> {
     let sock = SmartSocket::new(port);
     let before = sock.is_up().then(|| listener(port)).flatten();
 
-    // A replaced image cannot be identified either way, and it also still owns the mDNS socket,
-    // so the isolated probe would answer Absent regardless. Guessing has already been wrong once
-    // in each direction; say so instead.
-    if gate_step(before.as_ref(), adb, before.as_ref().map(|l| l.pid)) == GateStep::Indeterminate {
-        let l = before.as_ref().expect("indeterminate implies a listener");
-        bail!(
-            "the adb server on port {port} (pid {}) is running a replaced binary, so its mDNS \
-             support cannot be established, and a probe cannot take the socket from it.\n\
-             Restart it and re-run: systemctl --user restart wadb",
-            l.pid
-        );
-    }
-    if let Some(l) = &before {
-        if let Ok(answer) = sock.mdns_check() {
-            // Tie the answer to one process: comparing only paths lets A pass the first check,
-            // B answer, and C pass the second.
-            if gate_step(Some(l), adb, listener(port).map(|a| a.pid)) == GateStep::Trust {
+    let answer = before.as_ref().and_then(|_| sock.mdns_check().ok());
+    // Sampled again after the answer, and compared in full: an update during the request keeps the
+    // pid and only flips `replaced`.
+    let after = sock.is_up().then(|| listener(port)).flatten();
+
+    match gate_step(before.as_ref(), after.as_ref(), adb) {
+        GateStep::Trust => {
+            if let Some(answer) = answer {
                 return Ok(answer);
             }
+            // Attributable server, but it would not answer. A probe cannot take the socket from
+            // it either, so there is nothing true to report.
+            bail!(
+                "the adb server on port {port} did not answer an mDNS check, and a probe cannot \
+                 take the socket while it is running.\n\
+                 Restart it and re-run: systemctl --user restart wadb"
+            );
+        }
+        GateStep::Probe => probe_mdns_support(adb),
+        GateStep::Indeterminate => {
+            let l = after.as_ref().or(before.as_ref());
+            bail!(
+                "an adb server on port {port}{} holds the mDNS socket and cannot be attributed to \
+                 {}, so its support cannot be established and a probe cannot take the socket from \
+                 it.\n\
+                 Stop or restart that server and re-run: systemctl --user restart wadb",
+                l.map(|l| format!(" (pid {})", l.pid)).unwrap_or_default(),
+                adb.display()
+            );
         }
     }
-    probe_mdns_support(adb)
 }
 
 /// What the gate should do about the server currently on the port.
@@ -408,24 +417,36 @@ pub enum GateStep {
     Indeterminate,
 }
 
+/// Can this server's answer be attributed to the candidate binary?
+fn attributable(l: &Listener, adb: &Path) -> bool {
+    !l.replaced && same_binary(Some(&l.exe), adb)
+}
+
 /// Kept pure so every branch is testable without a network or an adb.
 ///
+/// The rule the previous three versions of this gate each missed one half of: **a probe is only
+/// safe when nothing holds the mDNS socket.** A live server we cannot attribute to this binary
+/// makes the question unanswerable — the probe underneath it would report `Absent` for a perfectly
+/// good adb — so the honest outcome is `Indeterminate`, not a guess in either direction.
+///
+/// Both snapshots are compared in full, not just by pid: an SDK update during the request keeps
+/// the pid and only flips `replaced`, which is how an old image came to vouch for a new file.
+///
 /// An `Absent` from a server that *is* this binary is trusted, not retried: a probe started
-/// underneath it cannot take the mDNS socket and would answer `Absent` too.
-pub fn gate_step(listener: Option<&Listener>, adb: &Path, pid_after: Option<u32>) -> GateStep {
-    let Some(l) = listener else {
+/// underneath it could not take the socket and would answer `Absent` too.
+pub fn gate_step(before: Option<&Listener>, after: Option<&Listener>, adb: &Path) -> GateStep {
+    let Some(after) = after else {
+        // Nothing holds the socket now, so an isolated probe can actually get it.
         return GateStep::Probe;
     };
-    if !same_binary(Some(&l.exe), adb) {
-        return GateStep::Probe;
+    match before {
+        Some(before)
+            if before.pid == after.pid && attributable(before, adb) && attributable(after, adb) =>
+        {
+            GateStep::Trust
+        }
+        _ => GateStep::Indeterminate,
     }
-    if l.replaced {
-        return GateStep::Indeterminate;
-    }
-    if pid_after != Some(l.pid) {
-        return GateStep::Probe;
-    }
-    GateStep::Trust
 }
 
 /// Start `adb` as its own server on a scratch port and ask *that* server whether it has
@@ -894,67 +915,89 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
 
     #[test]
     fn a_replaced_binary_is_reported_as_replaced() {
-        // Exercises exe_of itself rather than re-implementing the strip in the test, which is
-        // how the previous version of this test failed to catch that stripping the suffix makes
-        // an old image look identical to the new file at that path.
+        // Drives exe_of's `replaced` branch for real, by unlinking a running binary. The previous
+        // version of this test hand-rolled the suffix strip instead, which is exactly why it did
+        // not catch that stripping it let an old image vouch for the new file at that path.
         let dir = std::env::temp_dir().join(format!("wadb-del-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("proc-ish")).unwrap();
-        let target = dir.join("adb");
-        std::fs::write(&target, "x").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("sleeper");
+        std::fs::copy("/bin/sleep", &bin).unwrap();
 
-        // A live process: its exe is this test binary, and nothing is deleted.
-        let (exe, replaced) = exe_of(std::process::id()).expect("own exe is readable");
-        assert!(!replaced);
-        assert!(exe.to_string_lossy().contains("wadb"));
+        let mut child = Command::new(&bin).arg("30").spawn().unwrap();
+        let pid = child.id();
 
-        // And the parse of the deleted form, which /proc renders as a suffix.
-        let link = dir.join("exe");
-        std::os::unix::fs::symlink(format!("{} (deleted)", target.display()), &link).unwrap();
-        let raw = std::fs::read_link(&link).unwrap();
-        let text = raw.to_string_lossy();
-        assert!(text.ends_with(" (deleted)"));
-        assert_eq!(
-            text.strip_suffix(" (deleted)"),
-            Some(target.to_string_lossy().as_ref())
-        );
+        let (exe, replaced) = exe_of(pid).expect("a running child has a readable exe");
+        assert_eq!(exe, bin);
+        assert!(!replaced, "still on disk");
+
+        // The update: the file is replaced under the running process.
+        std::fs::remove_file(&bin).unwrap();
+        let (exe, replaced) = exe_of(pid).expect("exe stays readable after the file goes");
+        assert!(replaced, "/proc reports the image as deleted");
+        assert_eq!(exe, bin, "and the suffix is not part of the path");
+
+        // Which must make the gate refuse to answer rather than trust the stale image.
+        let l = Listener { pid, exe, replaced };
+        assert_eq!(gate_step(Some(&l), Some(&l), &bin), GateStep::Indeterminate);
+
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_gate_trusts_probes_or_gives_up_for_the_right_reasons() {
         let adb = Path::new("/opt/sdk/adb");
-        let live = |replaced| Listener {
-            pid: 42,
+        let ours = |pid, replaced| Listener {
+            pid,
             exe: adb.to_path_buf(),
             replaced,
         };
-
-        // This binary, same process throughout: take its word, negative answers included.
-        assert_eq!(
-            gate_step(Some(&live(false)), adb, Some(42)),
-            GateStep::Trust
-        );
-        // Nothing listening: probe.
-        assert_eq!(gate_step(None, adb, None), GateStep::Probe);
-        // A different binary holds the port: probe, which is what it is for.
-        let other = Listener {
-            pid: 42,
+        let other = |pid| Listener {
+            pid,
             exe: PathBuf::from("/usr/bin/adb"),
             replaced: false,
         };
-        assert_eq!(gate_step(Some(&other), adb, Some(42)), GateStep::Probe);
-        // The process changed under us: A answered, C is on the port now.
+
+        // This binary, same process, intact at both samples: take its word.
         assert_eq!(
-            gate_step(Some(&live(false)), adb, Some(99)),
+            gate_step(Some(&ours(42, false)), Some(&ours(42, false)), adb),
+            GateStep::Trust
+        );
+
+        // Nothing holds the socket at the end: a probe can actually get it.
+        assert_eq!(gate_step(None, None, adb), GateStep::Probe);
+        assert_eq!(
+            gate_step(Some(&ours(42, false)), None, adb),
             GateStep::Probe
         );
-        assert_eq!(gate_step(Some(&live(false)), adb, None), GateStep::Probe);
-        // Replaced image at this path: neither answer is true, so neither is given. Trusting it
-        // would let an old server vouch for a new binary; probing under it would refuse a good
-        // one. Both have already happened once.
+
+        // Replaced *during* the request: same pid, only `replaced` flips. This is the case that
+        // let an old image vouch for the new file at that path, and comparing pids alone missed it.
         assert_eq!(
-            gate_step(Some(&live(true)), adb, Some(42)),
+            gate_step(Some(&ours(42, false)), Some(&ours(42, true)), adb),
+            GateStep::Indeterminate
+        );
+        // Replaced before we started.
+        assert_eq!(
+            gate_step(Some(&ours(42, true)), Some(&ours(42, true)), adb),
+            GateStep::Indeterminate
+        );
+        // A different binary holds the socket. Probing under it would report Absent for a good
+        // candidate, so this is unanswerable rather than a probe.
+        assert_eq!(
+            gate_step(Some(&other(42)), Some(&other(42)), adb),
+            GateStep::Indeterminate
+        );
+        // The process changed under us.
+        assert_eq!(
+            gate_step(Some(&ours(42, false)), Some(&ours(99, false)), adb),
+            GateStep::Indeterminate
+        );
+        // A server appeared during the check: it now owns the socket, so no probe.
+        assert_eq!(
+            gate_step(None, Some(&ours(42, false)), adb),
             GateStep::Indeterminate
         );
     }
