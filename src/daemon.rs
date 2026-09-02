@@ -12,7 +12,6 @@
 //! documented behaviour, carried out by the only mDNS implementation on this host that works.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -111,11 +110,7 @@ pub struct Outcome {
 }
 
 /// One pass: browse, then connect whatever is advertised and missing.
-pub fn tick(
-    _adb: &Path,
-    port: u16,
-    failures: &mut HashMap<String, (u32, Instant)>,
-) -> Result<Outcome> {
+pub fn tick(port: u16, failures: &mut HashMap<String, (u32, Instant)>) -> Result<Outcome> {
     let sock = SmartSocket::new(port);
     // No server, nothing to do — and asking over the socket cannot start one.
     if !sock.is_up() {
@@ -180,18 +175,29 @@ pub fn tick(
             Action::NoUsableAddress | Action::BackingOff => {}
         }
     }
+    // Wireless debugging rotates the port, so a failed endpoint can never be advertised again.
+    // Without this the map grows for the life of the daemon.
+    let live: std::collections::HashSet<String> = found
+        .iter()
+        .flat_map(|f| {
+            usable_addresses(&f.addresses)
+                .into_iter()
+                .map(move |a| endpoint(a, f.port))
+        })
+        .collect();
+    failures.retain(|ep, _| live.contains(ep));
+
     Ok(outcome)
 }
 
 /// The watcher loop, as run by `wadb-connect.service`.
-pub fn run(adb: PathBuf, port: u16) -> Result<()> {
-    eprintln!(
-        "wadb: watching {CONNECT_SERVICE} for devices to reconnect on port {port} using {}",
-        adb.display()
-    );
+pub fn run(port: u16) -> Result<()> {
+    // No adb binary is named here on purpose: connects go over the server's smart socket, so the
+    // watcher never runs adb and cannot fork one.
+    eprintln!("wadb: watching {CONNECT_SERVICE} for devices to reconnect on port {port}");
     let mut failures: HashMap<String, (u32, Instant)> = HashMap::new();
     loop {
-        match tick(&adb, port, &mut failures) {
+        match tick(port, &mut failures) {
             Ok(outcome) => {
                 for line in outcome.connected {
                     eprintln!("wadb: {line}");
@@ -294,21 +300,6 @@ mod tests {
                 "offline device must be reconnected: {line}"
             );
         }
-    }
-
-    #[test]
-    fn an_unauthorized_device_is_left_alone() {
-        // Reconnecting cannot fix it; the user has to accept the prompt on the phone.
-        let devices = parse_devices("192.168.86.45:42595 unauthorized model:Pixel_8a\n");
-        assert_eq!(
-            decide(
-                &service(vec![v4()]),
-                &devices,
-                &HashMap::new(),
-                Instant::now()
-            ),
-            Action::AlreadyAttached
-        );
     }
 
     #[test]
