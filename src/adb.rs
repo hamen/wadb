@@ -340,12 +340,22 @@ pub struct Listener {
 /// would vouch for a new binary nobody has checked. Refusing on it instead brings back the false
 /// refusal. Neither is true, so the caller is told the identity is unknown.
 pub fn exe_of(pid: u32) -> Option<(PathBuf, bool)> {
-    let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    let text = link.to_string_lossy().into_owned();
-    Some(match text.strip_suffix(" (deleted)") {
+    Some(classify_exe(
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()?,
+    ))
+}
+
+/// The `/proc/<pid>/exe` link target split into a path and whether the image is gone.
+///
+/// Separated from the syscall so both branches are testable deterministically. The obvious
+/// alternative — copy a binary, run it, unlink it — needs process spawning, an executable `/tmp`
+/// and pid timing, and failed twice in CI for three different environmental reasons while the
+/// logic under test was two lines long.
+pub fn classify_exe(link: PathBuf) -> (PathBuf, bool) {
+    match link.to_string_lossy().strip_suffix(" (deleted)") {
         Some(real) => (PathBuf::from(real), true),
         None => (link, false),
-    })
+    }
 }
 
 pub fn listener(port: u16) -> Option<Listener> {
@@ -915,47 +925,41 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
 
     #[test]
     fn a_replaced_binary_is_reported_as_replaced() {
-        // Drives exe_of's `replaced` branch for real, by unlinking a running binary. The previous
-        // version of this test hand-rolled the suffix strip instead, which is exactly why it did
-        // not catch that stripping it let an old image vouch for the new file at that path.
-        let dir = std::env::temp_dir().join(format!("wadb-del-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("sleeper");
-        std::fs::copy("/bin/sleep", &bin).unwrap();
+        // Both branches of the real function, with no process, no /proc and no timing.
+        let (exe, replaced) = classify_exe(PathBuf::from("/opt/sdk/platform-tools/adb"));
+        assert_eq!(exe, PathBuf::from("/opt/sdk/platform-tools/adb"));
+        assert!(!replaced);
 
-        // Spawning a file this process just wrote can fail with ETXTBSY while another thread
-        // still holds a write descriptor to it — the copy is closed here, but a concurrent test
-        // forking inherits open descriptors, so the kernel can still see the image as busy.
-        // Retry briefly rather than making the suite order-dependent.
-        let mut child = loop {
-            match Command::new(&bin).arg("30").spawn() {
-                Ok(child) => break child,
-                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => panic!("could not start the throwaway binary: {e}"),
-            }
+        // What /proc reports after an SDK update replaces the file under a running server.
+        let (exe, replaced) = classify_exe(PathBuf::from("/opt/sdk/platform-tools/adb (deleted)"));
+        assert_eq!(
+            exe,
+            PathBuf::from("/opt/sdk/platform-tools/adb"),
+            "suffix is not part of the path"
+        );
+        assert!(replaced, "and the image must be reported as gone");
+
+        // Which must make the gate refuse to answer rather than trust the stale image: the path
+        // now matches the candidate exactly, which is precisely why stripping alone was unsafe.
+        let l = Listener {
+            pid: 1,
+            exe: exe.clone(),
+            replaced,
         };
-        let pid = child.id();
+        assert_eq!(
+            gate_step(Some(&l), Some(&l), Path::new("/opt/sdk/platform-tools/adb")),
+            GateStep::Indeterminate
+        );
 
-        let (exe, replaced) = exe_of(pid).expect("a running child has a readable exe");
-        assert_eq!(exe, bin);
-        assert!(!replaced, "still on disk");
+        // A path that merely contains the word is untouched.
+        let (exe, replaced) = classify_exe(PathBuf::from("/opt/deleted/adb"));
+        assert_eq!(exe, PathBuf::from("/opt/deleted/adb"));
+        assert!(!replaced);
 
-        // The update: the file is replaced under the running process.
-        std::fs::remove_file(&bin).unwrap();
-        let (exe, replaced) = exe_of(pid).expect("exe stays readable after the file goes");
-        assert!(replaced, "/proc reports the image as deleted");
-        assert_eq!(exe, bin, "and the suffix is not part of the path");
-
-        // Which must make the gate refuse to answer rather than trust the stale image.
-        let l = Listener { pid, exe, replaced };
-        assert_eq!(gate_step(Some(&l), Some(&l), &bin), GateStep::Indeterminate);
-
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&dir);
+        // And the live path still works for a process that is genuinely on disk.
+        let (exe, replaced) = exe_of(std::process::id()).expect("own exe is readable");
+        assert!(!replaced);
+        assert!(exe.to_string_lossy().contains("wadb"));
     }
 
     #[test]
