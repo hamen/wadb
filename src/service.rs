@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use crate::adb::{self, MdnsSupport, SmartSocket, DEFAULT_PORT};
 
 pub const UNIT_NAME: &str = "wadb.service";
+pub const CONNECT_UNIT_NAME: &str = "wadb-connect.service";
 
 /// `RestartSteps` and `RestartMaxDelaySec` need systemd 254. Ubuntu 22.04 ships 249, so a
 /// lower version gets a plain fixed interval instead of a refusal: a coarser backoff is a
@@ -94,6 +95,58 @@ LimitCORE=0
 WantedBy=default.target
 "
     )
+}
+
+/// The watcher unit.
+///
+/// It is deliberately NOT `BindsTo=wadb.service`: `adb kill-server` restarts the server unit, and
+/// `BindsTo` stops a dependent on restart without starting it again — which would kill the watcher
+/// at precisely the moment its whole job begins. `Wants=`/`After=` express the ordering without
+/// that behaviour, and the watcher waits for the server on its own anyway.
+pub fn render_connect_unit(wadb: &Path, port: u16) -> String {
+    let exec = quote_exec(wadb);
+    let mount_dir = wadb
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/".into());
+    format!(
+        "\
+[Unit]
+Description=Reconnect wireless ADB devices that adb's own mDNS cannot find (wadb)
+Documentation=https://github.com/hamen/wadb
+Wants={UNIT_NAME}
+After={UNIT_NAME}
+StartLimitIntervalSec=0
+RequiresMountsFor={mount_dir}
+
+[Service]
+Type=simple
+Environment=ANDROID_ADB_SERVER_PORT={port}
+ExecStart={exec} daemon
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+"
+    )
+}
+
+fn unit_dir() -> Result<PathBuf> {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
+        });
+    Ok(base.join("systemd/user"))
+}
+
+fn connect_unit_path() -> Result<PathBuf> {
+    Ok(unit_dir()?.join(CONNECT_UNIT_NAME))
+}
+
+pub fn connect_unit_active() -> bool {
+    systemctl_query(&["is-active", CONNECT_UNIT_NAME]) == "active"
 }
 
 fn unit_path() -> Result<PathBuf> {
@@ -249,8 +302,23 @@ pub fn install() -> Result<InstallReport> {
         std::fs::write(&path, &rendered)?;
     }
 
+    // The watcher runs this same binary, by absolute path: a user unit inherits no PATH that
+    // would find it.
+    let wadb = std::env::current_exe().context("could not locate the wadb binary")?;
+    let connect_rendered = render_connect_unit(&wadb, port);
+    let connect_path = connect_unit_path()?;
+    let connect_changed =
+        std::fs::read_to_string(&connect_path).ok().as_deref() != Some(connect_rendered.as_str());
+    if connect_changed {
+        std::fs::write(&connect_path, &connect_rendered)?;
+    }
+
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", "--now", UNIT_NAME])?;
+    systemctl(&["enable", "--now", CONNECT_UNIT_NAME])?;
+    if connect_changed {
+        systemctl(&["restart", CONNECT_UNIT_NAME])?;
+    }
     // `enable --now` does not restart a unit that is already running with an older
     // ExecStart or port.
     if changed {
@@ -291,6 +359,13 @@ pub fn restart() -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
+    // Stop the watcher first: it would otherwise keep reconnecting devices to a server that is
+    // about to go away.
+    if connect_unit_path().map(|p| p.exists()).unwrap_or(false) {
+        systemctl(&["disable", "--now", CONNECT_UNIT_NAME])
+            .context("could not stop the reconnect watcher")?;
+        let _ = std::fs::remove_file(connect_unit_path()?);
+    }
     // Failing here and still deleting the unit file would leave the server we own running
     // with nothing left to manage it.
     if installed_unit().is_some() {
@@ -437,6 +512,27 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(port, 5137);
+    }
+
+    #[test]
+    fn watcher_unit_survives_a_restart_of_the_server_unit() {
+        let unit = render_connect_unit(Path::new("/home/u/.cargo/bin/wadb"), DEFAULT_PORT);
+        // BindsTo would stop the watcher when the server unit restarts and never start it again -
+        // killing it at exactly the moment `adb kill-server` makes it necessary.
+        assert!(!unit.contains("BindsTo"));
+        assert!(unit.contains("Wants=wadb.service"));
+        assert!(unit.contains("After=wadb.service"));
+        assert!(unit.contains("Restart=always"));
+    }
+
+    #[test]
+    fn watcher_unit_runs_this_binary_by_absolute_path() {
+        // A --user unit inherits no PATH that would find `wadb`.
+        let unit = render_connect_unit(Path::new("/home/u/.cargo/bin/wadb"), 5137);
+        assert!(unit.contains("ExecStart=/home/u/.cargo/bin/wadb daemon"));
+        // And it must talk to the same port the server unit listens on.
+        assert!(unit.contains("Environment=ANDROID_ADB_SERVER_PORT=5137"));
+        assert!(unit.contains("WantedBy=default.target"));
     }
 
     #[test]

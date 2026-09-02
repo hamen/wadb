@@ -3,6 +3,7 @@
 //! wadb - keep the ADB server alive so paired phones stay available for wireless debugging.
 
 mod adb;
+mod daemon;
 mod discovery;
 mod pairing;
 mod qr;
@@ -44,6 +45,10 @@ enum Command {
     },
     /// Ask a foreign adb server to stop so the unit can take the port.
     Takeover,
+    /// Reconnect every advertised wireless device once, then exit.
+    Connect,
+    /// Run the reconnect watcher. This is what `wadb-connect.service` runs.
+    Daemon,
 }
 
 fn port() -> u16 {
@@ -69,6 +74,8 @@ fn main() -> Result<()> {
         Some(Command::Status) => status(),
         Some(Command::Pair { endpoint }) => pair_manually(&endpoint),
         Some(Command::Takeover) => takeover(),
+        Some(Command::Connect) => connect_once(),
+        Some(Command::Daemon) => daemon::run(adb_for_commands()?, port()),
         None => tui(),
     }
 }
@@ -153,6 +160,16 @@ fn status() -> Result<()> {
         ui::UnitState::NotInstalled => println!("unit:     not installed - run `wadb install`"),
         ui::UnitState::Active => println!("unit:     active"),
         ui::UnitState::Inactive => println!("unit:     installed but not active"),
+    }
+    if installed != ui::UnitState::NotInstalled {
+        println!(
+            "watcher:  {}",
+            if service::connect_unit_active() {
+                "active"
+            } else {
+                "NOT running - wireless devices will not come back on their own"
+            }
+        );
     }
 
     // With no unit there is nothing of ours on any port, and describing whatever else is
@@ -348,6 +365,24 @@ fn takeover() -> Result<()> {
             std::thread::sleep(Duration::from_millis(200));
         }
         println!("restarted the unit, but it has not taken the port yet.");
+    }
+    Ok(())
+}
+
+/// One pass of the watcher, by hand.
+fn connect_once() -> Result<()> {
+    let adb_path = adb_for_commands()?;
+    let port = port();
+    if !SmartSocket::new(port).is_up() {
+        bail!("no adb server on port {port}. Run `wadb install` first.");
+    }
+    let mut failures = std::collections::HashMap::new();
+    let connected = daemon::tick(&adb_path, port, &mut failures)?;
+    if connected.is_empty() {
+        println!("nothing to reconnect.");
+    }
+    for line in connected {
+        println!("{line}");
     }
     Ok(())
 }
