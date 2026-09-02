@@ -1,0 +1,26 @@
+[package]
+name = "wadb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Keeps the ADB server alive so paired Android phones stay available for wireless debugging, with a terminal UI for QR pairing"
+license = "Apache-2.0"
+repository = "https://github.com/hamen/wadb"
+readme = "README.md"
+keywords = ["adb", "android", "wireless-debugging", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+mdns-sd = "0.14"
+qrcode = { version = "0.14", default-features = false }
+# Only the crossterm backend is used; the default set also pulls termina and termwiz.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+rand = "0.9"
+rpassword = "7"
+zeroize = "1"
+
+[profile.release]
+strip = true

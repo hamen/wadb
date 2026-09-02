@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # On a pull_request, check out the head SHA so a green tick maps to the code
+      # that was reviewed, not to a synthetic merge commit. That ref is empty on
+      # push, where the default checkout is already correct.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # --locked everywhere, so CI runs the dependency versions that are committed.
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked

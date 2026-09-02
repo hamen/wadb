@@ -1,0 +1,9 @@
+wadb
+Copyright 2026 Ivan Morgillo
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This project is an independent Rust rewrite for Linux, inspired by wADB
+(https://github.com/c5inco/wADB), Copyright 2026 Chris Sinco, also licensed under
+the Apache License, Version 2.0. No source code from that project is included
+here; the QR pairing payload format it uses is Android's, not that project's.
