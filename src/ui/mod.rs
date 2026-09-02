@@ -170,7 +170,9 @@ impl App {
                     count,
                     "--no-pager",
                     "-o",
-                    "short-iso",
+                    // Precise: two units log within the same second often enough that
+                    // second resolution leaves their order down to which query ran first.
+                    "short-iso-precise",
                 ])
                 .output();
             if let Ok(out) = out {
@@ -271,38 +273,68 @@ pub fn parse_journal_line(line: &str) -> Option<JournalLine> {
     })
 }
 
-/// A key that orders timestamps correctly across a UTC offset change.
+/// Days since an arbitrary fixed date, exactly.
 ///
-/// `short-iso` stamps each entry with its own offset, so a plain string sort puts `+01:00` lines
-/// before `+02:00` lines during the repeated hour of a DST fall-back. Normalising to minutes from
-/// an arbitrary epoch avoids a date-time dependency; the date part only has to be monotonic, not
-/// calendrical.
+/// Howard Hinnant's civil-date algorithm. An approximation with 31-day months is not good enough:
+/// across a short month boundary with an offset change it inverts real order —
+/// `2026-03-01T00:15:00+01:00` is 23:15 UTC on the 28th of February, and so precedes
+/// `2026-02-28T23:30:00+00:00`, which a month-times-31 key gets backwards.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = (month + 9) % 12;
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// A key that orders timestamps by real time, in microseconds.
+///
+/// `journalctl` stamps each entry with its own UTC offset, so a plain string sort puts `+01:00`
+/// lines before `+02:00` lines during the repeated hour of a DST fall-back. Microsecond resolution
+/// matters because two units routinely log within the same second, and a coarser key leaves their
+/// order decided by which query ran first rather than by the journal.
 pub fn sort_key(timestamp: &str) -> i64 {
-    let bytes: Vec<i64> = timestamp
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|p| !p.is_empty())
-        .filter_map(|p| p.parse().ok())
-        .collect();
-    let [year, month, day, hour, minute, second, ..] = bytes[..] else {
+    let Some((date, rest)) = timestamp.split_once('T') else {
         return 0;
     };
-    let offset = match timestamp.rfind(['+', '-']).filter(|i| *i > 10) {
+    let (time, offset_minutes) = match rest.rfind(['+', '-']) {
         Some(i) => {
-            let sign = if timestamp.as_bytes()[i] == b'-' {
-                -1
-            } else {
-                1
-            };
-            let rest = &timestamp[i + 1..];
-            let h: i64 = rest.get(..2).and_then(|v| v.parse().ok()).unwrap_or(0);
-            let m: i64 = rest.get(3..5).and_then(|v| v.parse().ok()).unwrap_or(0);
-            sign * (h * 60 + m)
+            let sign = if rest.as_bytes()[i] == b'-' { -1 } else { 1 };
+            let zone = &rest[i + 1..];
+            let hours: i64 = zone.get(..2).and_then(|v| v.parse().ok()).unwrap_or(0);
+            let minutes: i64 = zone.get(3..5).and_then(|v| v.parse().ok()).unwrap_or(0);
+            (&rest[..i], sign * (hours * 60 + minutes))
         }
-        None => 0,
+        None => (rest.trim_end_matches('Z'), 0),
     };
-    // Seconds matter: two lines in the same minute are common, and dropping them made their keys
-    // identical, so the merge fell back to whichever query happened to run first.
-    ((((year * 12 + month) * 31 + day) * 1440 + hour * 60 + minute - offset) * 60) + second
+
+    let number = |part: Option<&str>| -> i64 { part.and_then(|p| p.parse().ok()).unwrap_or(0) };
+    let mut date = date.split('-');
+    let days = days_from_civil(
+        number(date.next()),
+        number(date.next()),
+        number(date.next()),
+    );
+
+    let mut time = time.split(':');
+    let hours = number(time.next());
+    let minutes = number(time.next());
+    let (seconds, fraction) = match time.next() {
+        Some(s) => match s.split_once('.') {
+            // Pad or trim to microseconds, whatever precision the journal used.
+            Some((whole, frac)) => (
+                whole.parse().unwrap_or(0),
+                format!("{frac:0<6}")[..6].parse().unwrap_or(0),
+            ),
+            None => (s.parse().unwrap_or(0), 0),
+        },
+        None => (0, 0),
+    };
+
+    ((((days * 1440 + hours * 60 + minutes - offset_minutes) * 60) + seconds) * 1_000_000)
+        + fraction
 }
 
 /// Is this line worth a user's attention?
@@ -331,7 +363,11 @@ pub fn worth_showing(line: &JournalLine) -> bool {
 /// Drops adb's `file.cpp:NN` source location, of no use outside adb's own tree, and systemd's
 /// restatement of the unit description, which is the same forty characters on every line.
 pub fn shorten_log(message: &str) -> String {
-    let message = match message.split_once(".cpp:") {
+    // adb's C++ sources, and openscreen's, which log from `.cc` files.
+    let source_location = message
+        .split_once(".cpp:")
+        .or_else(|| message.split_once(".cc:"));
+    let message = match source_location {
         // Whatever follows the line number, even if there is nothing after it. Returning the
         // original here would keep the one thing this function exists to remove.
         Some((_, rest)) => rest.split_once(' ').map(|(_, m)| m).unwrap_or(""),
@@ -908,6 +944,11 @@ mod tests {
         // Nothing after the line number: the source location must still go, since removing it is
         // the entire point of the function.
         assert_eq!(shorten_log("1 1 W adb : adb.cpp:100"), "");
+        // openscreen logs from .cc files, and its warnings would have kept the path.
+        assert_eq!(
+            shorten_log("1 1 W openscreen: discovery.cc:44 mdns socket unavailable"),
+            "mdns socket unavailable"
+        );
     }
 
     #[test]
@@ -927,12 +968,12 @@ mod tests {
         // Two units, interleaved, arriving in the wrong order as they do from two queries.
         let lines = vec![
             JournalLine {
-                timestamp: "2026-09-02T16:26:53+02:00".into(),
+                timestamp: "2026-09-02T16:26:53.500000+02:00".into(),
                 process: "wadb".into(),
                 message: "wadb: connected to 192.168.86.45:42595".into(),
             },
             JournalLine {
-                timestamp: "2026-09-02T16:26:40+02:00".into(),
+                timestamp: "2026-09-02T16:26:40.100000+02:00".into(),
                 process: "systemd".into(),
                 message: "Started wadb-connect.service - Reconnect wireless ADB devices.".into(),
             },
@@ -947,11 +988,59 @@ mod tests {
     }
 
     #[test]
+    fn same_second_lines_keep_journal_order() {
+        // Two units routinely log within the same second. At second resolution their keys were
+        // equal and the order came from whichever query ran first, not from the journal.
+        let first = "2026-09-02T16:26:53.101000+02:00";
+        let second = "2026-09-02T16:26:53.987000+02:00";
+        assert!(sort_key(first) < sort_key(second));
+
+        let lines = vec![
+            JournalLine {
+                timestamp: second.into(),
+                process: "wadb".into(),
+                message: "wadb: connected to 192.168.86.45:42595".into(),
+            },
+            JournalLine {
+                timestamp: first.into(),
+                process: "systemd".into(),
+                message: "Started wadb-connect.service - Reconnect wireless ADB devices.".into(),
+            },
+        ];
+        let rendered = render_log_lines(lines);
+        assert!(rendered[0].contains("Started"), "got {rendered:?}");
+        assert!(rendered[1].contains("connected"), "got {rendered:?}");
+    }
+
+    #[test]
+    fn dates_are_exact_across_a_short_month_boundary() {
+        // 00:15 on 1 March at +01:00 is 23:15 UTC on 28 February, so it precedes 23:30 UTC that
+        // day. A key giving every month 31 days puts them the other way round.
+        let earlier = "2026-03-01T00:15:00.000000+01:00";
+        let later = "2026-02-28T23:30:00.000000+00:00";
+        assert!(
+            sort_key(earlier) < sort_key(later),
+            "March 1st 00:15+01:00 is earlier in real time than February 28th 23:30 UTC"
+        );
+        // Consecutive days across the boundary stay in order.
+        assert!(
+            sort_key("2026-02-28T12:00:00.000000+00:00")
+                < sort_key("2026-03-01T12:00:00.000000+00:00")
+        );
+        // And a leap day is a real day.
+        assert_eq!(
+            sort_key("2028-03-01T00:00:00.000000+00:00")
+                - sort_key("2028-02-29T00:00:00.000000+00:00"),
+            86_400_000_000
+        );
+    }
+
+    #[test]
     fn timestamps_order_correctly_across_a_utc_offset_change() {
         // A DST fall-back repeats an hour with a different offset. 02:30+02:00 is 00:30 UTC and
         // happened BEFORE 02:10+01:00, which is 01:10 UTC — the reverse of a string sort.
-        let earlier = "2026-10-25T02:30:00+02:00"; // 00:30 UTC
-        let later = "2026-10-25T02:10:00+01:00"; // 01:10 UTC
+        let earlier = "2026-10-25T02:30:00.000000+02:00"; // 00:30 UTC
+        let later = "2026-10-25T02:10:00.000000+01:00"; // 01:10 UTC
         assert!(
             later < earlier,
             "a plain string sort would put the later entry first"
