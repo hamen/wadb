@@ -75,7 +75,7 @@ fn main() -> Result<()> {
         Some(Command::Pair { endpoint }) => pair_manually(&endpoint),
         Some(Command::Takeover) => takeover(),
         Some(Command::Connect) => connect_once(),
-        Some(Command::Daemon) => daemon::run(adb_for_commands()?, port()),
+        Some(Command::Daemon) => daemon::run(port()),
         None => tui(),
     }
 }
@@ -371,13 +371,12 @@ fn takeover() -> Result<()> {
 
 /// One pass of the watcher, by hand.
 fn connect_once() -> Result<()> {
-    let adb_path = adb_for_commands()?;
     let port = port();
     if !SmartSocket::new(port).is_up() {
         bail!("no adb server on port {port}. Run `wadb install` first.");
     }
     let mut failures = std::collections::HashMap::new();
-    let outcome = daemon::tick(&adb_path, port, &mut failures)?;
+    let outcome = daemon::tick(port, &mut failures)?;
     for line in &outcome.connected {
         println!("{line}");
     }
