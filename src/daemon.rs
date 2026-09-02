@@ -12,17 +12,16 @@
 //! documented behaviour, carried out by the only mDNS implementation on this host that works.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::adb::{Device, SmartSocket, Transport};
 use crate::discovery::Found;
 use crate::pairing::{connect_cancellable, endpoint, usable_addresses, CONNECT_SERVICE};
 
-/// How often the watcher looks.
+/// Pause between passes. A full cycle is this plus `BROWSE`.
 pub const POLL: Duration = Duration::from_secs(5);
 /// How long each browse listens before acting on what it heard.
 pub const BROWSE: Duration = Duration::from_secs(3);
@@ -31,24 +30,41 @@ pub const BROWSE: Duration = Duration::from_secs(3);
 pub const FAILURES_BEFORE_BACKOFF: u32 = 3;
 pub const BACKOFF: Duration = Duration::from_secs(60);
 
-/// Is this discovered service already attached?
+/// Is this discovered service present AND usable?
 ///
-/// A device can be present under either serial shape, and after a manual connect it is present
-/// under both. Either counts as attached: reconnecting an attached device is at best noise.
-pub fn already_attached(found: &Found, addr: IpAddr, devices: &[Device]) -> bool {
-    let ep = endpoint(addr, found.port);
-    devices.iter().any(|d| match d.transport {
-        Transport::Tcp => d.serial == ep,
-        // `adb-<serial>-<suffix>._adb-tls-connect._tcp`
-        Transport::Mdns => d.serial.starts_with(found.instance()),
-        _ => false,
-    })
+/// Presence is not enough. adb keeps an `offline` entry for a device whose transport died, which is
+/// exactly what a suspend/resume or a dropped link leaves behind — so treating any entry as
+/// "attached" would make the watcher skip the very case it exists for. Only `device` counts.
+/// `unauthorized` also counts, because reconnecting cannot fix it: the user must accept the prompt.
+///
+/// Every advertised address is checked, not just the one we would dial. A phone attached over its
+/// IPv6 address is attached, and dialing its IPv4 address would give the same handset a second row.
+pub fn already_attached(found: &Found, devices: &[Device]) -> bool {
+    let endpoints: Vec<String> = usable_addresses(&found.addresses)
+        .into_iter()
+        .map(|a| endpoint(a, found.port))
+        .collect();
+    devices
+        .iter()
+        .filter(|d| d.state == "device" || d.state == "unauthorized")
+        .any(|d| match d.transport {
+            Transport::Tcp => endpoints.contains(&d.serial),
+            // `adb-<serial>-<suffix>._adb-tls-connect._tcp`. Compare on a label boundary so a short
+            // instance cannot match a longer one.
+            Transport::Mdns => d
+                .serial
+                .split('.')
+                .next()
+                .is_some_and(|i| i == found.instance()),
+            _ => false,
+        })
 }
 
 /// What the watcher should do about one discovered service.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    Connect(String),
+    /// Addresses to try, in order. More than one, so a dead IPv4 does not hide a working IPv6.
+    Connect(Vec<String>),
     AlreadyAttached,
     /// Nothing adb can dial: every address was loopback or link-local.
     NoUsableAddress,
@@ -63,57 +79,95 @@ pub fn decide(
     failures: &HashMap<String, (u32, Instant)>,
     now: Instant,
 ) -> Action {
-    let Some(addr) = usable_addresses(&found.addresses).into_iter().next() else {
+    let addresses = usable_addresses(&found.addresses);
+    if addresses.is_empty() {
         return Action::NoUsableAddress;
-    };
-    if already_attached(found, addr, devices) {
+    }
+    if already_attached(found, devices) {
         return Action::AlreadyAttached;
     }
-    let ep = endpoint(addr, found.port);
-    if let Some((count, last)) = failures.get(&ep) {
-        if *count >= FAILURES_BEFORE_BACKOFF && now.duration_since(*last) < BACKOFF {
-            return Action::BackingOff;
-        }
+    let backed_off = |ep: &String| {
+        failures.get(ep).is_some_and(|(count, last)| {
+            *count >= FAILURES_BEFORE_BACKOFF && now.duration_since(*last) < BACKOFF
+        })
+    };
+    let candidates: Vec<String> = addresses
+        .into_iter()
+        .map(|a| endpoint(a, found.port))
+        .filter(|ep| !backed_off(ep))
+        .collect();
+    if candidates.is_empty() {
+        return Action::BackingOff;
     }
-    Action::Connect(ep)
+    Action::Connect(candidates)
 }
 
 /// One pass: browse, then connect whatever is advertised and missing.
+/// What one pass did. Failures are reported, not swallowed: a caller that printed
+/// "nothing to reconnect" after every attempt failed would be lying.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    pub connected: Vec<String>,
+    pub failed: Vec<String>,
+}
+
 pub fn tick(
     adb: &Path,
     port: u16,
     failures: &mut HashMap<String, (u32, Instant)>,
-) -> Result<Vec<String>> {
+) -> Result<Outcome> {
     let sock = SmartSocket::new(port);
     // No server, nothing to do — and asking over the socket cannot start one.
     if !sock.is_up() {
-        return Ok(Vec::new());
+        return Ok(Outcome::default());
     }
-    let devices = sock.devices().unwrap_or_default();
+    // A device list we could not read is not an empty device list. Treating a failed query as
+    // "nothing is attached" would make every advertised phone look missing and earn a connect.
+    let devices = sock
+        .devices()
+        .context("could not read the device list; skipping this pass")?;
     let found = crate::discovery::browse_all(CONNECT_SERVICE, BROWSE)?;
+    // The browse takes seconds, in which the server can go away. Connecting then would spawn an
+    // unsupervised server and race the unit's restart.
+    if !sock.is_up() {
+        return Ok(Outcome::default());
+    }
 
-    let mut connected = Vec::new();
+    let mut outcome = Outcome::default();
     for service in &found {
         match decide(service, &devices, failures, Instant::now()) {
-            Action::Connect(ep) => {
-                let cancel = std::sync::atomic::AtomicBool::new(false);
-                match connect_cancellable(adb, port, &ep, &cancel) {
-                    Ok(line) => {
-                        failures.remove(&ep);
-                        connected.push(line);
-                    }
-                    Err(e) => {
-                        let entry = failures.entry(ep).or_insert((0, Instant::now()));
-                        entry.0 += 1;
-                        entry.1 = Instant::now();
-                        eprintln!("wadb: connect failed: {e}");
+            Action::Connect(candidates) => {
+                let mut attached = false;
+                for ep in &candidates {
+                    let cancel = std::sync::atomic::AtomicBool::new(false);
+                    match connect_cancellable(adb, port, ep, &cancel) {
+                        Ok(line) => {
+                            failures.remove(ep);
+                            outcome.connected.push(line);
+                            attached = true;
+                            break;
+                        }
+                        Err(e) => {
+                            let entry = failures.entry(ep.clone()).or_insert((0, Instant::now()));
+                            entry.0 += 1;
+                            entry.1 = Instant::now();
+                            outcome.failed.push(format!("{ep}: {e}"));
+                        }
                     }
                 }
+                let _ = attached;
             }
-            Action::AlreadyAttached | Action::NoUsableAddress | Action::BackingOff => {}
+            // A device that came back by any means clears its history, or a stale streak would
+            // keep it backed off after it is healthy again.
+            Action::AlreadyAttached => {
+                for a in usable_addresses(&service.addresses) {
+                    failures.remove(&endpoint(a, service.port));
+                }
+            }
+            Action::NoUsableAddress | Action::BackingOff => {}
         }
     }
-    Ok(connected)
+    Ok(outcome)
 }
 
 /// The watcher loop, as run by `wadb-connect.service`.
@@ -125,12 +179,15 @@ pub fn run(adb: PathBuf, port: u16) -> Result<()> {
     let mut failures: HashMap<String, (u32, Instant)> = HashMap::new();
     loop {
         match tick(&adb, port, &mut failures) {
-            Ok(connected) => {
-                for line in connected {
+            Ok(outcome) => {
+                for line in outcome.connected {
                     eprintln!("wadb: {line}");
                 }
+                for line in outcome.failed {
+                    eprintln!("wadb: connect failed: {line}");
+                }
             }
-            Err(e) => eprintln!("wadb: browse failed: {e}"),
+            Err(e) => eprintln!("wadb: pass failed: {e}"),
         }
         std::thread::sleep(POLL);
     }
@@ -140,7 +197,7 @@ pub fn run(adb: PathBuf, port: u16) -> Result<()> {
 mod tests {
     use super::*;
     use crate::adb::parse_devices;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn service(addrs: Vec<IpAddr>) -> Found {
         Found {
@@ -154,10 +211,22 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(192, 168, 86, 45))
     }
 
+    fn connect_targets(action: Action) -> Vec<String> {
+        match action {
+            Action::Connect(eps) => eps,
+            other => panic!("expected a connect, got {other:?}"),
+        }
+    }
+
     #[test]
     fn connects_a_device_that_is_advertised_but_missing() {
-        let action = decide(&service(vec![v4()]), &[], &HashMap::new(), Instant::now());
-        assert_eq!(action, Action::Connect("192.168.86.45:42595".into()));
+        let eps = connect_targets(decide(
+            &service(vec![v4()]),
+            &[],
+            &HashMap::new(),
+            Instant::now(),
+        ));
+        assert_eq!(eps, ["192.168.86.45:42595"]);
     }
 
     #[test]
@@ -176,11 +245,48 @@ mod tests {
 
     #[test]
     fn skips_a_device_already_attached_under_its_mdns_serial() {
-        // This is the shape adb's own auto-connect produces, and the one that appears after a
-        // restart on a machine where adb's discovery does work.
         let devices = parse_devices(
             "adb-3C231JEKB44234-9igruZ._adb-tls-connect._tcp device model:Pixel_8a\n",
         );
+        assert_eq!(
+            decide(
+                &service(vec![v4()]),
+                &devices,
+                &HashMap::new(),
+                Instant::now()
+            ),
+            Action::AlreadyAttached
+        );
+    }
+
+    #[test]
+    fn an_offline_device_is_reconnected_not_treated_as_present() {
+        // The case the watcher exists for. adb keeps an `offline` entry after a transport dies -
+        // a suspend/resume, a dropped link - and counting that as attached would skip it forever.
+        for line in [
+            "192.168.86.45:42595 offline model:Pixel_8a\n",
+            "adb-3C231JEKB44234-9igruZ._adb-tls-connect._tcp offline model:Pixel_8a\n",
+        ] {
+            let devices = parse_devices(line);
+            assert!(
+                matches!(
+                    decide(
+                        &service(vec![v4()]),
+                        &devices,
+                        &HashMap::new(),
+                        Instant::now()
+                    ),
+                    Action::Connect(_)
+                ),
+                "offline device must be reconnected: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unauthorized_device_is_left_alone() {
+        // Reconnecting cannot fix it; the user has to accept the prompt on the phone.
+        let devices = parse_devices("192.168.86.45:42595 unauthorized model:Pixel_8a\n");
         assert_eq!(
             decide(
                 &service(vec![v4()]),
@@ -207,7 +313,34 @@ mod tests {
     }
 
     #[test]
-    fn prefers_ipv4_and_ignores_link_local_ipv6() {
+    fn a_shorter_instance_does_not_match_a_longer_serial() {
+        let mut svc = service(vec![v4()]);
+        svc.fullname = "adb-3C231._adb-tls-connect._tcp.local.".into();
+        let devices = parse_devices(
+            "adb-3C231JEKB44234-9igruZ._adb-tls-connect._tcp device model:Pixel_8a\n",
+        );
+        assert!(matches!(
+            decide(&svc, &devices, &HashMap::new(), Instant::now()),
+            Action::Connect(_)
+        ));
+    }
+
+    #[test]
+    fn attachment_is_checked_against_every_advertised_address() {
+        // Attached over IPv6; dialing the IPv4 address would give the same handset a second row.
+        let devices = parse_devices("[fde7:3f3c:51e7:f10a::1]:42595 device model:Pixel_8a\n");
+        let addrs = vec![
+            v4(),
+            IpAddr::V6("fde7:3f3c:51e7:f10a::1".parse::<Ipv6Addr>().unwrap()),
+        ];
+        assert_eq!(
+            decide(&service(addrs), &devices, &HashMap::new(), Instant::now()),
+            Action::AlreadyAttached
+        );
+    }
+
+    #[test]
+    fn offers_every_usable_address_in_order_ipv4_first() {
         // The real advert from the Pixel 8a carried nine addresses, mostly IPv6 including a
         // link-local one, which adb cannot dial without a scope id.
         let addrs = vec![
@@ -215,9 +348,22 @@ mod tests {
             IpAddr::V6("fde7:3f3c:51e7:f10a::1".parse::<Ipv6Addr>().unwrap()),
             v4(),
         ];
+        let eps = connect_targets(decide(
+            &service(addrs),
+            &[],
+            &HashMap::new(),
+            Instant::now(),
+        ));
+        assert_eq!(eps[0], "192.168.86.45:42595", "IPv4 is tried first");
         assert_eq!(
-            decide(&service(addrs), &[], &HashMap::new(), Instant::now()),
-            Action::Connect("192.168.86.45:42595".into())
+            eps.len(),
+            2,
+            "a dead IPv4 must not hide a working global IPv6"
+        );
+        assert!(eps[1].starts_with('['), "IPv6 endpoints are bracketed");
+        assert!(
+            !eps.iter().any(|e| e.contains("fe80")),
+            "link-local is undialable"
         );
     }
 
@@ -249,6 +395,27 @@ mod tests {
             decide(&service(vec![v4()]), &[], &failures, later),
             Action::Connect(_)
         ));
+    }
+
+    #[test]
+    fn backoff_on_one_address_still_leaves_the_others() {
+        let now = Instant::now();
+        let mut failures = HashMap::new();
+        failures.insert(
+            "192.168.86.45:42595".to_string(),
+            (FAILURES_BEFORE_BACKOFF, now),
+        );
+        let addrs = vec![
+            v4(),
+            IpAddr::V6("fde7:3f3c:51e7:f10a::1".parse::<Ipv6Addr>().unwrap()),
+        ];
+        let eps = connect_targets(decide(&service(addrs), &[], &failures, now));
+        assert_eq!(
+            eps.len(),
+            1,
+            "the backed-off IPv4 is dropped, the IPv6 remains"
+        );
+        assert!(eps[0].starts_with('['));
     }
 
     #[test]
