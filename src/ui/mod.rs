@@ -146,27 +146,55 @@ impl App {
         self.pair_rx = None;
     }
 
-    /// The unit's own journal, so the pane shows history from before the TUI started.
+    /// Both units' journals, so the pane shows history from before the TUI started.
+    ///
+    /// Reading only the server unit meant the pane was entirely adb's internal C++ logging, while
+    /// the lines a user actually wants — the watcher reporting a reconnect — live in the other
+    /// unit and never appeared at all.
     pub fn refresh_logs(&mut self) {
-        let out = std::process::Command::new("journalctl")
-            .args([
-                "--user",
-                "-u",
-                crate::service::UNIT_NAME,
-                "-n",
-                "40",
-                "--no-pager",
-                "-o",
-                "cat",
-            ])
-            .output();
-        if let Ok(out) = out {
-            self.logs = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(str::to_string)
-                .collect();
+        // Queried per unit rather than as one merged stream. adb's volume is such that a merged
+        // `-n` window is entirely its own chatter, and a `--since` window wide enough to reach
+        // past it took nearly two seconds — unusable in a render loop. Two narrow queries take
+        // about nine milliseconds each.
+        let mut lines: Vec<(String, String)> = Vec::new();
+        for (unit, count) in [
+            (crate::service::CONNECT_UNIT_NAME, "40"),
+            (crate::service::UNIT_NAME, "200"),
+        ] {
+            let out = std::process::Command::new("journalctl")
+                .args([
+                    "--user",
+                    "-u",
+                    unit,
+                    "-n",
+                    count,
+                    "--no-pager",
+                    "-o",
+                    "short-iso",
+                ])
+                .output();
+            if let Ok(out) = out {
+                lines.extend(
+                    String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .filter_map(parse_journal_line)
+                        .filter(|(_, message)| worth_showing(message)),
+                );
+            }
         }
+        // Same timezone from one journal, so the timestamps sort lexicographically.
+        lines.sort_by(|a, b| a.0.cmp(&b.0));
+        self.logs = lines
+            .into_iter()
+            .map(|(timestamp, message)| {
+                let clock = timestamp.split('T').nth(1).unwrap_or(&timestamp);
+                format!(
+                    "{}  {}",
+                    &clock[..clock.len().min(8)],
+                    shorten_log(&message)
+                )
+            })
+            .collect();
     }
 
     /// Drain whatever the pairing worker has reported.
@@ -217,6 +245,53 @@ impl App {
             Vec::new()
         };
         self.owner = service::port_owner(self.port);
+    }
+}
+
+/// One journal line, split so it can be sorted, filtered and rendered.
+///
+/// `journalctl -o short-iso` gives `<iso-ts> <host> <unit>[<pid>]: <message>`.
+pub fn parse_journal_line(line: &str) -> Option<(String, String)> {
+    let (timestamp, rest) = line.split_once(' ')?;
+    if !timestamp.starts_with("20") {
+        return None;
+    }
+    // Strip `<host> <process>[<pid>]: `.
+    let message = rest.split_once("]: ").map(|(_, m)| m).unwrap_or(rest);
+    Some((timestamp.to_string(), message.trim().to_string()))
+}
+
+/// Is this journal message worth a user's attention?
+///
+/// adb logs its own internals at info — transport lifecycle, libusb threads, key loading — dozens
+/// of lines per device per restart, enough that our own reconnect messages fell outside a
+/// thousand-line window entirely. Warnings and errors from adb are kept; those are worth reading.
+pub fn worth_showing(message: &str) -> bool {
+    if message.trim().is_empty() {
+        return false;
+    }
+    // `<pid> <tid> <level> adb : file.cpp:NN message`
+    let level = message
+        .split(" adb ")
+        .next()
+        .and_then(|head| head.rsplit(' ').find(|token| token.len() == 1));
+    !matches!(level, Some("I") | Some("D") | Some("V"))
+}
+
+/// Trim a message to what is readable in a narrow pane.
+///
+/// Drops adb's `file.cpp:NN` source location, of no use outside adb's own tree, and systemd's
+/// restatement of the unit description, which is the same forty characters on every line.
+pub fn shorten_log(message: &str) -> String {
+    let message = match message.split_once(".cpp:") {
+        Some((_, rest)) => rest.split_once(' ').map(|(_, m)| m).unwrap_or(message),
+        None => message,
+    };
+    match message.split_once(" - ") {
+        Some((head, _)) if head.ends_with(".service") || head.contains(".service:") => {
+            head.to_string()
+        }
+        _ => message.trim().to_string(),
     }
 }
 
@@ -677,6 +752,79 @@ mod tests {
         app.unit = UnitState::Active;
         let out = draw(&app, 90, 30);
         assert!(!out.contains(" i "), "nothing to install once it is active");
+    }
+
+    #[test]
+    fn journal_lines_split_into_timestamp_and_message() {
+        let line = "2026-09-02T16:26:53+02:00 money-maker wadb[1455422]: wadb: connected to 192.168.86.45:42595";
+        let (ts, msg) = parse_journal_line(line).expect("a short-iso line parses");
+        assert_eq!(ts, "2026-09-02T16:26:53+02:00");
+        assert_eq!(msg, "wadb: connected to 192.168.86.45:42595");
+        // Anything that is not a timestamped line is ignored rather than shown raw.
+        assert!(parse_journal_line("-- Boot 1a2b --").is_none());
+        assert!(parse_journal_line("").is_none());
+    }
+
+    #[test]
+    fn systemd_unit_descriptions_are_trimmed() {
+        // Every systemd line restates the same forty-character description.
+        assert_eq!(
+            shorten_log("Started wadb-connect.service - Reconnect wireless ADB devices that adb's own mDNS cannot find (wadb)."),
+            "Started wadb-connect.service"
+        );
+        assert_eq!(
+            shorten_log("wadb: connected to 192.168.86.45:42595"),
+            "wadb: connected to 192.168.86.45:42595"
+        );
+    }
+
+    #[test]
+    fn adb_internal_chatter_is_filtered_out() {
+        // Real lines captured from the pane, which was five-sixths this.
+        let noise = [
+            "09-02 18:30:19.663 1455377 1455377 I adb     : transport.cpp:404 BlockingConnectionAdapter(<unknown>): not started",
+            "09-02 18:30:19.675 1455377 1455377 I adb     : transport.cpp:302 BlockingConnectionAdapter(<unknown>): destructing",
+            "09-01 12:53:28.419 2726685 2726774 I adb     : usb_libusb.cpp:119 35191FDHS0003Q: write thread spawning",
+            "09-01 12:53:28.599 2726685 2726685 I adb     : transport.cpp:1720 fetching keys for transport EXAMPLEDEVICE",
+            "",
+        ];
+        for line in noise {
+            assert!(!worth_showing(line), "should be filtered: {line}");
+        }
+    }
+
+    #[test]
+    fn the_lines_a_user_wants_survive() {
+        // Our own watcher output, and systemd's unit lifecycle.
+        for line in [
+            "wadb: connected to 192.168.86.45:42595",
+            "wadb: watching _adb-tls-connect._tcp.local. for devices to reconnect on port 5037",
+            "Started wadb.service - Keep the ADB server running for wireless debugging (wadb).",
+            "Stopping wadb-connect.service - Reconnect wireless ADB devices…",
+            "wadb.service: Consumed 18.196s CPU time, 6.3M memory peak.",
+        ] {
+            assert!(worth_showing(line), "should be kept: {line}");
+        }
+    }
+
+    #[test]
+    fn adb_warnings_and_errors_are_kept() {
+        // The whole point of filtering by level rather than by the word "adb".
+        for line in [
+            "09-02 18:30:19.663 1455377 1455377 W adb     : adb.cpp:100 failed to bind socket",
+            "09-02 18:30:19.663 1455377 1455377 E adb     : adb.cpp:100 could not read key",
+            "09-02 18:30:19.663 1455377 1455377 F adb     : main.cpp:167 could not install listener",
+        ] {
+            assert!(worth_showing(line), "should be kept: {line}");
+        }
+    }
+
+    #[test]
+    fn adb_source_locations_are_stripped() {
+        assert_eq!(
+            shorten_log("09-02 18:30 1 1 W adb     : adb.cpp:100 failed to bind socket"),
+            "failed to bind socket"
+        );
     }
 
     #[test]
