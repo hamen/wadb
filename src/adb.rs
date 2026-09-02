@@ -296,6 +296,55 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Are these the same executable?
+///
+/// `/proc/<pid>/exe` is already resolved, so a candidate reached through a symlink - here the SDK
+/// lives under a `~/Android` symlink into another filesystem - never string-matches it. Comparing
+/// the raw paths silently disables the fast path and sends every check down the flaky probe.
+fn same_binary(running: Option<&Path>, candidate: &Path) -> bool {
+    let Some(running) = running else { return false };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(running) == canon(candidate)
+}
+
+/// The executable behind a listening adb server, so we can tell whether the server already
+/// running is the very binary we are about to gate.
+pub fn listener_exe(port: u16) -> Option<PathBuf> {
+    let out = Command::new("ss")
+        .args(["-ltnpH", "sport", "=", &format!(":{port}")])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (_, rest) = text.split_once("pid=")?;
+    let pid: u32 = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|t| !t.is_empty())?
+        .parse()
+        .ok()?;
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+/// Does this binary have an mDNS backend?
+///
+/// Asks the server already running on `port` when that server *is* this binary, and only spawns
+/// an isolated probe otherwise.
+///
+/// The order matters, and getting it wrong is how this went wrong before. Only one adb server can
+/// hold the mDNS socket at a time, so a probe server started while a working server is up cannot
+/// initialise openscreen and answers empty — which the gate then reads as "this binary has no
+/// backend" and refuses a perfectly good adb. That is the same class of error the isolated probe
+/// exists to prevent, arriving from the other direction: the first version trusted a server that
+/// was not this binary, this one distrusted a server that was.
+pub fn mdns_support(adb: &Path, port: u16) -> Result<MdnsSupport> {
+    let sock = SmartSocket::new(port);
+    if sock.is_up() && same_binary(listener_exe(port).as_deref(), adb) {
+        if let Ok(MdnsSupport::Present(v)) = sock.mdns_check() {
+            return Ok(MdnsSupport::Present(v));
+        }
+    }
+    probe_mdns_support(adb)
+}
+
 /// Start `adb` as its own server on a scratch port and ask *that* server whether it has
 /// an mDNS backend. Retries the port on a bind clash, which is a TOCTOU race and must not
 /// be reported as a bad binary.
@@ -444,6 +493,13 @@ impl SmartSocket {
         self.request_with_timeout(&format!("host:connect:{endpoint}"), Duration::from_secs(12))
     }
 
+    /// Ask a *running* server whether it has an mDNS backend, over the smart socket.
+    ///
+    /// This is the same question `adb mdns check` asks, without a child process.
+    pub fn mdns_check(&self) -> Result<MdnsSupport> {
+        Ok(parse_mdns_check(&self.request("host:mdns:check")?))
+    }
+
     /// What adb's own mDNS backend can currently see. A compiled-in backend is not proof
     /// that discovery is working right now.
     pub fn mdns_services(&self) -> Result<String> {
@@ -452,7 +508,7 @@ impl SmartSocket {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]
@@ -591,6 +647,7 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
     #[test]
     #[ignore = "requires the real adb binaries; run with --ignored"]
     fn probe_tells_the_two_real_binaries_apart() {
+        let _mdns = MDNS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::var("HOME").unwrap();
         let sdk = PathBuf::from(format!("{home}/Android/Sdk/platform-tools/adb"));
         let debian = PathBuf::from("/usr/bin/adb");
@@ -602,12 +659,14 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
         let foreign_is_up = SmartSocket::new(DEFAULT_PORT).is_up();
         eprintln!("foreign server on 5037 during probe: {foreign_is_up}");
 
-        match probe_mdns_support(&sdk).unwrap() {
+        // Through the real entry point: a server already holding the mDNS socket must not make
+        // the good binary look backend-less, which is exactly what the bare probe did.
+        match mdns_support(&sdk, DEFAULT_PORT).unwrap() {
             MdnsSupport::Present(v) => eprintln!("sdk adb -> {v}"),
-            MdnsSupport::Absent => panic!("SDK adb has openscreen; probe reported Absent"),
+            MdnsSupport::Absent => panic!("SDK adb has openscreen; gate reported Absent"),
         }
         assert_eq!(
-            probe_mdns_support(&debian).unwrap(),
+            mdns_support(&debian, DEFAULT_PORT).unwrap(),
             MdnsSupport::Absent,
             "Debian adb has no mDNS backend; probe must not be fooled by a foreign server"
         );
@@ -627,6 +686,11 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
     /// Serialises the tests that poison the process environment: `set_var` is visible to
     /// every other test running in parallel.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialises tests that need the host's mDNS socket. Only one process can hold it, so a
+    /// browse running in parallel with a probe makes the probe's server come up without
+    /// openscreen and report a good binary as having no backend.
+    pub static MDNS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn probe_spawns_aims_and_tears_down() {
@@ -711,6 +775,24 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
             "probe server {pid} outlived the probe and would fight the real unit"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlinked_path_is_recognised_as_the_same_binary() {
+        // The SDK here is reached through a ~/Android symlink onto another filesystem, while
+        // /proc/<pid>/exe reports the resolved path.
+        let dir = std::env::temp_dir().join(format!("wadb-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        let real = dir.join("real/adb");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(dir.join("real"), &link).unwrap();
+
+        assert!(same_binary(Some(&real), &link.join("adb")));
+        assert!(!same_binary(Some(&real), Path::new("/usr/bin/adb")));
+        assert!(!same_binary(None, &real));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

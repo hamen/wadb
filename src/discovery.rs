@@ -125,6 +125,9 @@ mod tests {
     #[test]
     #[ignore = "touches the network; run with --ignored"]
     fn browser_starts_alongside_avahi() {
+        let _mdns = crate::adb::tests::MDNS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         let found = browse_all(PAIRING_SERVICE, Duration::from_secs(2))
             .expect("mdns-sd must start while avahi-daemon holds 5353");

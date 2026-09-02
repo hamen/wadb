@@ -266,11 +266,18 @@ pub struct InstallReport {
     pub backoff_full: bool,
 }
 
+fn port_from_env() -> u16 {
+    std::env::var("ANDROID_ADB_SERVER_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
+
 pub fn install() -> Result<InstallReport> {
     let adb_path = adb::resolve_adb()?;
 
     // The gate. Probe the resolved binary in isolation before trusting it with the unit.
-    let mdns = match adb::probe_mdns_support(&adb_path)? {
+    let mdns = match adb::mdns_support(&adb_path, port_from_env())? {
         MdnsSupport::Present(v) => v,
         MdnsSupport::Absent => bail!(
             "{} (version {}) has no mDNS backend, so adb cannot reconnect paired devices \
@@ -283,10 +290,7 @@ pub fn install() -> Result<InstallReport> {
         ),
     };
 
-    let port = std::env::var("ANDROID_ADB_SERVER_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
+    let port = port_from_env();
     let systemd = systemd_version();
     let spec = UnitSpec {
         adb: adb_path.clone(),
