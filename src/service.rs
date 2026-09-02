@@ -277,7 +277,12 @@ pub fn install() -> Result<InstallReport> {
     let adb_path = adb::resolve_adb()?;
 
     // The gate. Probe the resolved binary in isolation before trusting it with the unit.
-    let mdns = match adb::mdns_support(&adb_path, port_from_env())? {
+    // The socket that matters belongs to whichever server is running *now*, which is the
+    // currently installed unit's port - not the port we are about to install on. Checking only
+    // the target port misses a server on the old port that still owns the mDNS socket, and the
+    // probe then answers Absent underneath it.
+    let holding_port = installed_port().unwrap_or_else(port_from_env);
+    let mdns = match adb::mdns_support(&adb_path, holding_port)? {
         MdnsSupport::Present(v) => v,
         MdnsSupport::Absent => bail!(
             "{} (version {}) has no mDNS backend, so adb cannot reconnect paired devices \
