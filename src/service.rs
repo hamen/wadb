@@ -281,7 +281,15 @@ pub fn install() -> Result<InstallReport> {
     // currently installed unit's port - not the port we are about to install on. Checking only
     // the target port misses a server on the old port that still owns the mDNS socket, and the
     // probe then answers Absent underneath it.
-    let holding_port = installed_port().unwrap_or_else(port_from_env);
+    // installed_port() only says what the unit file *claims*. If that unit is stopped and some
+    // other server is on the target port, checking the empty old port would probe while that
+    // server owns the mDNS socket. Use whichever port actually has something listening.
+    let target = port_from_env();
+    let holding_port = [installed_port(), Some(target)]
+        .into_iter()
+        .flatten()
+        .find(|p| adb::SmartSocket::new(*p).is_up())
+        .unwrap_or(target);
     let mdns = match adb::mdns_support(&adb_path, holding_port)? {
         MdnsSupport::Present(v) => v,
         MdnsSupport::Absent => bail!(
@@ -295,7 +303,7 @@ pub fn install() -> Result<InstallReport> {
         ),
     };
 
-    let port = port_from_env();
+    let port = target;
     let systemd = systemd_version();
     let spec = UnitSpec {
         adb: adb_path.clone(),
