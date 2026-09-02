@@ -307,21 +307,44 @@ fn same_binary(running: Option<&Path>, candidate: &Path) -> bool {
     canon(running) == canon(candidate)
 }
 
+/// Serialises anything needing the host's mDNS socket. Only one process can hold it, so a browse
+/// running beside a probe makes the probe's server come up without openscreen and report a good
+/// binary as having no backend.
+#[cfg(test)]
+pub static MDNS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The executable behind a listening adb server, so we can tell whether the server already
 /// running is the very binary we are about to gate.
+pub fn parse_ss_pid(text: &str) -> Option<u32> {
+    let (_, rest) = text.split_once("pid=")?;
+    rest.split(|c: char| !c.is_ascii_digit())
+        .find(|t| !t.is_empty())?
+        .parse()
+        .ok()
+}
+
+/// Read a process's executable.
+///
+/// The link reads `<path> (deleted)` when the binary has been replaced under a running process —
+/// which is exactly what an SDK platform-tools update does to an adb server nobody restarted.
+/// Left as-is, the suffix makes the path fail to canonicalise, the identity check fail, and the
+/// gate fall back to a probe under the live server: the false refusal this whole file is about,
+/// returning on the next SDK update.
+pub fn exe_of(pid: u32) -> Option<PathBuf> {
+    let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let text = link.to_string_lossy();
+    Some(match text.strip_suffix(" (deleted)") {
+        Some(real) => PathBuf::from(real),
+        None => link.clone(),
+    })
+}
+
 pub fn listener_exe(port: u16) -> Option<PathBuf> {
     let out = Command::new("ss")
         .args(["-ltnpH", "sport", "=", &format!(":{port}")])
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let (_, rest) = text.split_once("pid=")?;
-    let pid: u32 = rest
-        .split(|c: char| !c.is_ascii_digit())
-        .find(|t| !t.is_empty())?
-        .parse()
-        .ok()?;
-    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    exe_of(parse_ss_pid(&String::from_utf8_lossy(&out.stdout))?)
 }
 
 /// Does this binary have an mDNS backend?
@@ -337,12 +360,41 @@ pub fn listener_exe(port: u16) -> Option<PathBuf> {
 /// was not this binary, this one distrusted a server that was.
 pub fn mdns_support(adb: &Path, port: u16) -> Result<MdnsSupport> {
     let sock = SmartSocket::new(port);
-    if sock.is_up() && same_binary(listener_exe(port).as_deref(), adb) {
-        if let Ok(MdnsSupport::Present(v)) = sock.mdns_check() {
-            return Ok(MdnsSupport::Present(v));
+    let ask_running = || -> Option<MdnsSupport> {
+        if !sock.is_up() {
+            return None;
         }
+        let answer = accept_running_answer(
+            same_binary(listener_exe(port).as_deref(), adb),
+            sock.mdns_check().ok(),
+            // Re-checked afterwards: the server can stop and a different binary take the port
+            // between the two requests, which would attribute a stranger's answer to this binary.
+            || same_binary(listener_exe(port).as_deref(), adb),
+        );
+        answer
+    };
+    match ask_running() {
+        Some(answer) => Ok(answer),
+        None => probe_mdns_support(adb),
     }
-    probe_mdns_support(adb)
+}
+
+/// Should the running server's answer be accepted for this binary?
+///
+/// Kept separate so the branch is testable without a network or an adb. Note that an `Absent` from
+/// a server that *is* this binary is accepted, not retried: a probe started underneath it cannot
+/// take the mDNS socket and would answer `Absent` too, so the fallback costs seconds and changes
+/// nothing.
+pub fn accept_running_answer(
+    identity_before: bool,
+    answer: Option<MdnsSupport>,
+    identity_after: impl FnOnce() -> bool,
+) -> Option<MdnsSupport> {
+    if !identity_before {
+        return None;
+    }
+    let answer = answer?;
+    identity_after().then_some(answer)
 }
 
 /// Start `adb` as its own server on a scratch port and ask *that* server whether it has
@@ -508,7 +560,7 @@ impl SmartSocket {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -647,7 +699,7 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
     #[test]
     #[ignore = "requires the real adb binaries; run with --ignored"]
     fn probe_tells_the_two_real_binaries_apart() {
-        let _mdns = MDNS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _mdns = super::MDNS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::var("HOME").unwrap();
         let sdk = PathBuf::from(format!("{home}/Android/Sdk/platform-tools/adb"));
         let debian = PathBuf::from("/usr/bin/adb");
@@ -656,8 +708,13 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
             "both binaries must be present"
         );
 
-        let foreign_is_up = SmartSocket::new(DEFAULT_PORT).is_up();
-        eprintln!("foreign server on 5037 during probe: {foreign_is_up}");
+        // The point of this test is that a server already holding the mDNS socket does not make
+        // the good binary look backend-less. With nothing on the port it proves nothing.
+        let server_is_up = SmartSocket::new(DEFAULT_PORT).is_up();
+        assert!(
+            server_is_up,
+            "start an adb server on {DEFAULT_PORT} first, or this test passes vacuously"
+        );
 
         // Through the real entry point: a server already holding the mDNS socket must not make
         // the good binary look backend-less, which is exactly what the bare probe did.
@@ -673,7 +730,7 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
 
         // The probe must leave nothing behind.
         assert!(
-            SmartSocket::new(DEFAULT_PORT).is_up() == foreign_is_up,
+            SmartSocket::new(DEFAULT_PORT).is_up() == server_is_up,
             "probe changed the state of the real server"
         );
     }
@@ -686,11 +743,6 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
     /// Serialises the tests that poison the process environment: `set_var` is visible to
     /// every other test running in parallel.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Serialises tests that need the host's mDNS socket. Only one process can hold it, so a
-    /// browse running in parallel with a probe makes the probe's server come up without
-    /// openscreen and report a good binary as having no backend.
-    pub static MDNS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn probe_spawns_aims_and_tears_down() {
@@ -776,6 +828,82 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_the_pid_out_of_ss_output() {
+        // Canned, because the live path is only exercised by an ignored hardware test.
+        let line = "LISTEN 0 4096 127.0.0.1:5037 0.0.0.0:* users:((\"adb\",pid=2466481,fd=10))";
+        assert_eq!(parse_ss_pid(line), Some(2466481));
+        // `ss` without -p, or a socket owned by another user, prints no pid at all.
+        assert_eq!(parse_ss_pid("LISTEN 0 4096 127.0.0.1:5037 0.0.0.0:*"), None);
+        assert_eq!(parse_ss_pid(""), None);
+    }
+
+    #[test]
+    fn listener_exe_finds_the_process_holding_a_port() {
+        // Deterministic coverage of the live path: this test process is the listener.
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let found = listener_exe(port);
+        if let Some(found) = found {
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            assert_eq!(canon(&found), canon(&std::env::current_exe().unwrap()));
+        }
+        // A None result is legitimate where `ss` is absent; it degrades to the isolated probe.
+    }
+
+    #[test]
+    fn a_replaced_binary_still_resolves() {
+        // An SDK update renames the file under the running server, and the link then reads
+        // "<path> (deleted)". Without stripping it, the gate falsely refuses the new binary.
+        let dir = std::env::temp_dir().join(format!("wadb-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("adb");
+        std::fs::write(&target, "x").unwrap();
+        let link = dir.join("exe");
+        std::os::unix::fs::symlink(format!("{} (deleted)", target.display()), &link).unwrap();
+        let raw = std::fs::read_link(&link).unwrap();
+        assert!(raw.to_string_lossy().ends_with(" (deleted)"));
+        assert_eq!(
+            raw.to_string_lossy()
+                .strip_suffix(" (deleted)")
+                .map(PathBuf::from),
+            Some(target.clone())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_running_server_is_trusted_only_while_it_is_this_binary() {
+        let present = || Some(MdnsSupport::Present("v".into()));
+        // Same binary, answers: taken, including a negative answer - a probe underneath that
+        // server cannot get the socket and would deterministically say the same thing.
+        assert_eq!(
+            accept_running_answer(true, present(), || true),
+            Some(MdnsSupport::Present("v".into()))
+        );
+        assert_eq!(
+            accept_running_answer(true, Some(MdnsSupport::Absent), || true),
+            Some(MdnsSupport::Absent)
+        );
+        // Not this binary: fall back to the isolated probe.
+        assert_eq!(accept_running_answer(false, present(), || true), None);
+        // Replaced between the identity check and the answer: a stranger's answer must not be
+        // attributed to this binary.
+        assert_eq!(accept_running_answer(true, present(), || false), None);
+        // No answer at all: probe.
+        assert_eq!(accept_running_answer(true, None, || true), None);
+    }
+
+    #[test]
+    fn the_socket_body_parses_like_the_command_output() {
+        // Captured from `host:mdns:check` on the smart socket, which is what the fast path reads.
+        assert_eq!(
+            parse_mdns_check("mdns daemon version [Openscreen discovery 0.0.0]"),
+            MdnsSupport::Present("mdns daemon version [Openscreen discovery 0.0.0]".into())
+        );
     }
 
     #[test]

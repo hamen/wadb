@@ -125,7 +125,7 @@ mod tests {
     #[test]
     #[ignore = "touches the network; run with --ignored"]
     fn browser_starts_alongside_avahi() {
-        let _mdns = crate::adb::tests::MDNS_LOCK
+        let _mdns = crate::adb::MDNS_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
