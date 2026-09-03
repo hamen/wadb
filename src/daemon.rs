@@ -264,9 +264,8 @@ mod tests {
 
     #[test]
     fn skips_a_device_already_attached_under_its_mdns_serial() {
-        let devices = parse_devices(
-            "adb-EXAMPLEDEVICE-a1b2c3._adb-tls-connect._tcp device model:Pixel_8a\n",
-        );
+        let devices =
+            parse_devices("adb-EXAMPLEDEVICE-a1b2c3._adb-tls-connect._tcp device model:Pixel_8a\n");
         assert_eq!(
             decide(
                 &service(vec![v4()]),
@@ -340,9 +339,8 @@ mod tests {
     fn a_shorter_instance_does_not_match_a_longer_serial() {
         let mut svc = service(vec![v4()]);
         svc.fullname = "adb-3C231._adb-tls-connect._tcp.local.".into();
-        let devices = parse_devices(
-            "adb-EXAMPLEDEVICE-a1b2c3._adb-tls-connect._tcp device model:Pixel_8a\n",
-        );
+        let devices =
+            parse_devices("adb-EXAMPLEDEVICE-a1b2c3._adb-tls-connect._tcp device model:Pixel_8a\n");
         assert!(matches!(
             decide(&svc, &devices, &HashMap::new(), Instant::now()),
             Action::Connect(_)
