@@ -95,7 +95,7 @@ at all:
 
 | adb | `mdns check` |
 |---|---|
-| Android SDK Platform-Tools 36 | `mdns daemon version [Openscreen discovery 0.0.0]` |
+| Android SDK Platform-Tools 36.0.0 | `mdns daemon version [Openscreen discovery 0.0.0]` |
 | Debian/Ubuntu `adb` 34.0.5 | *(nothing)* |
 
 And having the backend is **not sufficient**. Only one adb server can hold the host's mDNS socket,
@@ -147,8 +147,8 @@ single-use credential with a short life, and `wadb` does not persist it, but it 
 held only in locked memory.
 
 `wadb` stores nothing — no device list, no keys, no pairing state. Device state is always read live
-from the adb server. It uses your existing adb server, keys and pairings, with no helper daemon and
-no third-party relay.
+from the adb server. It uses your existing adb server, keys and pairings — the only long-running
+processes are the two `systemd --user` units described above, and there is no third-party relay.
 
 ## Credits
 

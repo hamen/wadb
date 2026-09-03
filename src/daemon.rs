@@ -220,7 +220,7 @@ mod tests {
 
     fn service(addrs: Vec<IpAddr>) -> Found {
         Found {
-            fullname: "adb-3C231JEKB44234-9igruZ._adb-tls-connect._tcp.local.".into(),
+            fullname: "adb-EXAMPLEDEVICE-a1b2c3._adb-tls-connect._tcp.local.".into(),
             addresses: addrs,
             port: 42595,
         }
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn skips_a_device_already_attached_under_its_mdns_serial() {
         let devices = parse_devices(
-            "adb-3C231JEKB44234-9igruZ._adb-tls-connect._tcp device model:Pixel_8a\n",
+            "adb-EXAMPLEDEVICE-a1b2c3._adb-tls-connect._tcp device model:Pixel_8a\n",
         );
         assert_eq!(
             decide(
@@ -284,7 +284,7 @@ mod tests {
         // a suspend/resume, a dropped link - and counting that as attached would skip it forever.
         for line in [
             "192.168.86.45:42595 offline model:Pixel_8a\n",
-            "adb-3C231JEKB44234-9igruZ._adb-tls-connect._tcp offline model:Pixel_8a\n",
+            "adb-EXAMPLEDEVICE-a1b2c3._adb-tls-connect._tcp offline model:Pixel_8a\n",
         ] {
             let devices = parse_devices(line);
             assert!(
@@ -306,7 +306,7 @@ mod tests {
     fn an_unauthorized_device_is_left_alone_under_either_serial() {
         for line in [
             "192.168.86.45:42595 unauthorized model:Pixel_8a\n",
-            "adb-3C231JEKB44234-9igruZ._adb-tls-connect._tcp unauthorized model:Pixel_8a\n",
+            "adb-EXAMPLEDEVICE-a1b2c3._adb-tls-connect._tcp unauthorized model:Pixel_8a\n",
         ] {
             let devices = parse_devices(line);
             assert_eq!(
@@ -341,7 +341,7 @@ mod tests {
         let mut svc = service(vec![v4()]);
         svc.fullname = "adb-3C231._adb-tls-connect._tcp.local.".into();
         let devices = parse_devices(
-            "adb-3C231JEKB44234-9igruZ._adb-tls-connect._tcp device model:Pixel_8a\n",
+            "adb-EXAMPLEDEVICE-a1b2c3._adb-tls-connect._tcp device model:Pixel_8a\n",
         );
         assert!(matches!(
             decide(&svc, &devices, &HashMap::new(), Instant::now()),
