@@ -41,9 +41,9 @@ t+6s  device is back
 
 No new QR scan, no manual `adb connect`.
 
-Two `systemd --user` units do the work. One supervises the standard adb server on
-`127.0.0.1:5037` and restarts it if anything stops it. The other watches for wireless devices and
-reconnects them. Android Studio, the `adb` command line and every other adb client see the same
+Two `systemd --user` units do the work. **`wadb.service`** supervises the standard adb server on
+`127.0.0.1:5037` and restarts it if anything stops it. **`wadb-connect.service`** watches for
+wireless devices and reconnects them. Android Studio, the `adb` command line and every other adb client see the same
 devices — `wadb` owns nothing they don't.
 
 ## Requirements
@@ -83,6 +83,7 @@ wadb pair 192.168.86.45:37219    # ip:port from the phone's Wireless debugging s
 | `wadb status` | units, server, adb binary, mDNS discovery, devices |
 | `wadb pair <ip:port>` | pair with a typed six-digit code |
 | `wadb connect` | reconnect every advertised device once, by hand |
+| `wadb daemon` | the reconnect watcher; this is what `wadb-connect.service` runs |
 | `wadb takeover` | ask a foreign adb server to stop so the unit can take the port |
 | `wadb uninstall` | stop and remove both units |
 
@@ -111,12 +112,21 @@ device that already trusts this host's key, so nobody else's phone can be attach
 on your `PATH`, and the moment any tool runs it while the supervised server is down, it forks a
 replacement with no mDNS and takes the port.
 
+Checking this correctly is subtler than it looks. **`adb mdns check` reports the state of whichever
+*server* answers, not of the binary you invoked** — point Debian's adb at an SDK server and it will
+happily claim an openscreen daemon it does not have. So `wadb install` starts the candidate binary
+as its own server on a scratch port and questions *that* server, then tears it down. And because
+only one server can hold the mDNS socket, a probe is only meaningful when nothing else holds it: if
+a running server cannot be attributed to the candidate, `wadb install` reports that the answer
+cannot be established and asks you to restart it, rather than guessing.
+
 ## Notes and limitations
 
 - **Only wireless devices are listed.** USB devices and emulators stay available to every adb
   client; they're just not what this tool is about.
 - **`wadb` never kills an adb server it doesn't own.** If another server holds the port it says so
-  and offers `wadb takeover`, which sends adb's own cooperative `kill-server`.
+  and offers `wadb takeover`, which sends adb's own cooperative `kill-server` request. Nothing is
+  ever signalled directly.
 - `wadb uninstall` stops the server the units owned, which drops the USB and emulator sessions
   attached to it. The next adb command from any tool starts a fresh server — possibly one with no
   mDNS backend.
