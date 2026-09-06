@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Android Studio's convention for the instance name it puts in the QR. Kept for
 /// compatibility; this is a convention, not an OS requirement.
@@ -89,8 +89,15 @@ impl Payload {
     }
 
     /// The string encoded into the QR the phone scans.
-    pub fn qr_text(&self) -> String {
-        format!("WIFI:T:ADB;S:{};P:{};;", self.instance, self.password)
+    ///
+    /// Returned in a `Zeroizing` wrapper: this string contains the password, and a plain `String`
+    /// would leave those bytes in freed memory when it drops. The README claims the password is
+    /// zeroized after use, and that claim has to be true of every copy, not only the field.
+    pub fn qr_text(&self) -> Zeroizing<String> {
+        Zeroizing::new(format!(
+            "WIFI:T:ADB;S:{};P:{};;",
+            self.instance, self.password
+        ))
     }
 
     /// Does a discovered mDNS service belong to the phone that scanned our code?
@@ -540,6 +547,22 @@ mod tests {
         assert!(text.ends_with(";;"));
         assert!(is_valid_qr_text(&text));
         assert_eq!(p.instance().len(), PREFIX.len() + 10);
+    }
+
+    #[test]
+    fn the_qr_string_wipes_itself() {
+        // The README promises the password is zeroized after use. A plain String returned here
+        // would leave it in freed memory, which is the one copy nobody was wiping.
+        let payload = Payload::random().unwrap();
+        let text = payload.qr_text();
+        let ptr = text.as_ptr();
+        let len = text.len();
+        assert!(text.contains(";P:"));
+        drop(text);
+        // Reading freed memory is undefined behaviour, so this asserts the type contract instead:
+        // Zeroizing wipes on drop, and the value we hand out is wrapped in it.
+        let _: fn(&Payload) -> Zeroizing<String> = Payload::qr_text;
+        assert!(len > 0 && !ptr.is_null());
     }
 
     #[test]

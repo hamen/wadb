@@ -26,7 +26,8 @@ whenever the connection drops — a crash, a suspend, Android Studio quitting, o
 </p>
 
 The same phone appears twice above, on purpose: once as `192.168.86.45:42595` after an explicit
-connect, and once under its mDNS name after adb's own auto-connect attached it. They are two
+connect, and once under its mDNS name, on an occasion when adb's own discovery did win the socket
+race (see below for why it often does not). They are two
 transports to one handset, and `wadb` shows both rather than guessing which to hide.
 
 ## What it actually does
@@ -90,7 +91,8 @@ wadb pair 192.168.86.45:37219    # ip:port from the phone's Wireless debugging s
 ## Why the adb binary matters
 
 adb is *supposed* to reconnect trusted wireless devices itself: with an mDNS backend it browses
-`_adb-tls-connect._tcp` and auto-connects what it finds. Distro builds frequently have no backend
+`_adb-tls-connect._tcp` and auto-connects the services named in `$ADB_MDNS_AUTO_CONNECT`
+(default `adb-tls-connect`). Distro builds frequently have no backend
 at all:
 
 | adb | `mdns check` |
