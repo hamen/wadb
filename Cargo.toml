@@ -21,6 +21,9 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 rand = "0.9"
 rpassword = "7"
 zeroize = "1"
+# Blocking feature only: the rest of this crate is synchronous, and the default feature set
+# pulls in tokio and an async runtime for what is a DBus object with a menu on it.
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 
 [profile.release]
 strip = true

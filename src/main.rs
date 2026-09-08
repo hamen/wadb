@@ -8,6 +8,7 @@ mod discovery;
 mod pairing;
 mod qr;
 mod service;
+mod tray;
 mod ui;
 
 use std::io::IsTerminal;
@@ -49,6 +50,8 @@ enum Command {
     Connect,
     /// Run the reconnect watcher. This is what `wadb-connect.service` runs.
     Daemon,
+    /// Show a status-bar icon with the device list, for panels that speak StatusNotifierItem.
+    Tray,
 }
 
 fn port() -> u16 {
@@ -76,6 +79,7 @@ fn main() -> Result<()> {
         Some(Command::Takeover) => takeover(),
         Some(Command::Connect) => connect_once(),
         Some(Command::Daemon) => daemon::run(port()),
+        Some(Command::Tray) => tray::run(port(), adb_for_commands().ok()),
         None => tui(),
     }
 }
