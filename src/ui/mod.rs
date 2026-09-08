@@ -104,6 +104,8 @@ impl App {
                 return;
             }
         };
+        // Bound the lifetime of the payload string: it holds the password, and it is wiped when
+        // this scope ends rather than lingering in freed memory.
         let qr = match crate::qr::encode(payload.qr_text().as_bytes()) {
             Ok(m) => m,
             Err(e) => {
