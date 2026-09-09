@@ -68,8 +68,10 @@ pub fn basename(program: &str) -> &str {
 /// bare shell: exit 0, no TUI, and nothing for the settle check to notice.
 ///
 /// The target still decides whether sizing is worth attempting, which is why this returns the name
-/// rather than a bool: `gnome-terminal.wrapper` faithfully translates `-geometry` into a
-/// `--geometry` that GNOME Terminal has ignored since 3.28, so sizing it is theatre.
+/// rather than a bool: a wrapper is worth sizing exactly when the terminal behind it takes a size.
+/// Both Debian wrappers here qualify; one around something with no row — `ptyxis.wrapper`, say —
+/// does not, and the alternatives step then declines it rather than opening a terminal it cannot
+/// size in preference to one it can.
 fn wrapper_target(program: &str) -> Option<&str> {
     basename(program).strip_suffix(".wrapper")
 }
@@ -77,8 +79,11 @@ fn wrapper_target(program: &str) -> Option<&str> {
 /// How to ask this terminal for a `cols` by `rows` window. An empty list means "this terminal
 /// cannot be sized from the command line", which is a fact about the terminal, not a gap here.
 ///
-/// Verified on this machine: kitty and xfce4-terminal. The rest are from each terminal's own
-/// documentation, which is why a rejected argument list is retried without it rather than trusted.
+/// Measured on this machine, by reading `stty size` from inside the window each one opens: kitty,
+/// xfce4-terminal, gnome-terminal, and `xfce4-terminal.wrapper` for the wrapper path — all 80x32.
+/// alacritty, foot, konsole and xterm are not installed here; their rows come from each terminal's
+/// own documentation, which is why a rejected argument list is retried without it rather than
+/// trusted.
 pub fn size_args(program: &str, cols: u16, rows: u16) -> Vec<String> {
     if let Some(target) = wrapper_target(program) {
         // xterm's syntax, because that is what the wrapper parses - but only when the terminal
@@ -102,30 +107,30 @@ fn row_size_args(name: &str, cols: u16, rows: u16) -> Vec<String> {
             "-o".into(),
             "remember_window_size=no".into(),
             "-o".into(),
-            (format!("initial_window_width={cols}c")),
+            format!("initial_window_width={cols}c"),
             "-o".into(),
-            (format!("initial_window_height={rows}c")),
+            format!("initial_window_height={rows}c"),
         ],
         "alacritty" => vec![
             "-o".into(),
-            (format!("window.dimensions.columns={cols}")),
+            format!("window.dimensions.columns={cols}"),
             "-o".into(),
-            (format!("window.dimensions.lines={rows}")),
+            format!("window.dimensions.lines={rows}"),
         ],
-        "foot" => vec![(format!("--window-size-chars={cols}x{rows}"))],
-        "xfce4-terminal" => vec![(format!("--geometry={cols}x{rows}"))],
+        "foot" => vec![format!("--window-size-chars={cols}x{rows}")],
+        "xfce4-terminal" => vec![format!("--geometry={cols}x{rows}")],
         "konsole" => vec![
             "-p".into(),
-            (format!("TerminalColumns={cols}")),
+            format!("TerminalColumns={cols}"),
             "-p".into(),
-            (format!("TerminalRows={rows}")),
+            format!("TerminalRows={rows}"),
         ],
-        "xterm" => vec!["-geometry".into(), (format!("{cols}x{rows}"))],
+        "xterm" => vec!["-geometry".into(), format!("{cols}x{rows}")],
         // GNOME Terminal takes --geometry too. A plan review reported it "deprecated since 3.28
         // and ignored", and that was carried for two plan revisions before anyone ran it: on
         // 3.56.2 here, --geometry=97x41 gives a 97x41 window and --geometry=63x21 a 63x21 one,
         // against a 80x24 default. Deprecated it may be; ignored it is not.
-        "gnome-terminal" => vec![(format!("--geometry={cols}x{rows}"))],
+        "gnome-terminal" => vec![format!("--geometry={cols}x{rows}")],
         _ => Vec::new(),
     }
 }
@@ -379,12 +384,14 @@ pub fn candidates() -> Vec<Candidate> {
     //    removes the reason. It must be found on PATH first — canonicalising a bare name resolves
     //    it against the working directory, not PATH, so this step would never run at all.
     let (cols, rows) = size();
+    let mut alternative_taken = false;
     if let Some(target) = resolve("x-terminal-emulator")
         .and_then(|p| std::fs::canonicalize(p).ok())
         .and_then(|p| p.to_str().map(str::to_string))
     {
         if !size_args(&target, cols, rows).is_empty() {
             out.push(Candidate::plain(&target));
+            alternative_taken = true;
         }
     }
 
@@ -395,8 +402,10 @@ pub fn candidates() -> Vec<Candidate> {
         }
     }
 
-    // 5. Last resort, unsized.
-    if resolve("x-terminal-emulator").is_some() {
+    // 5. Last resort, unsized — but only when step 3 passed on it. Step 3 carries the canonical
+    //    path and this one the bare name, so `dedup_by` can never collapse the two, and a failing
+    //    alternative would be spawned three times over.
+    if !alternative_taken && resolve("x-terminal-emulator").is_some() {
         out.push(Candidate::plain("x-terminal-emulator"));
     }
 
@@ -484,11 +493,14 @@ fn spawn_checked(argv: &[String]) -> Result<()> {
     let mut child = Command::new(&argv[0]).args(&argv[1..]).spawn()?;
     let deadline = Instant::now() + SETTLE;
     loop {
-        match child.try_wait()? {
-            Some(status) if status.success() => return Ok(()),
-            Some(status) => return Err(anyhow!("{} exited with {status}", argv[0])),
-            None if Instant::now() >= deadline => break,
-            None => std::thread::sleep(POLL),
+        // An `Err` from try_wait is not evidence the child died — EINTR, say. Treating it as a
+        // failure would retry, and the retry would put a second window on screen beside the first.
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(anyhow!("{} exited with {status}", argv[0])),
+            Ok(None) if Instant::now() >= deadline => break,
+            Err(_) => break,
+            Ok(None) => std::thread::sleep(POLL),
         }
     }
     // Still alive, so it is a real window. Reap it whenever it closes, or a closed terminal
@@ -535,7 +547,13 @@ pub fn open(exe: &Path) -> Result<Option<String>> {
             Err(_) => {}
         }
     }
-    Err(anyhow!("no terminal found; set $TERMINAL"))
+    match refused {
+        // Telling someone to set $TERMINAL when they set it is not help.
+        Some(failed) => Err(anyhow!(
+            "$TERMINAL ({failed}) failed, and no other terminal worked"
+        )),
+        None => Err(anyhow!("no terminal found; set $TERMINAL")),
+    }
 }
 
 #[cfg(test)]
@@ -696,6 +714,21 @@ mod tests {
                 &size_args("gnome-terminal", 80, 32),
             ),
             vec!["gnome-terminal", "--geometry=80x32", "--", "/x/wadb"]
+        );
+    }
+
+    #[test]
+    fn foot_takes_the_command_last_with_no_separator_at_all() {
+        // The one row whose shape is unique, and so the one that regresses if someone decides
+        // every terminal takes `-e` after all.
+        assert_eq!(separator("foot"), None);
+        assert_eq!(
+            argv(
+                &Candidate::plain("foot"),
+                Path::new("/x/wadb"),
+                &size_args("foot", 80, 32),
+            ),
+            vec!["foot", "--window-size-chars=80x32", "/x/wadb"]
         );
     }
 

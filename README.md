@@ -147,7 +147,7 @@ list above — the "terminal too small" screen is the backstop. If a terminal re
 arguments outright, wadb notices it exit and opens it again without them, so a wrong guess costs
 the size and never the window.
 
-Until `wadb install` has run, the icon stays offline and the menu says so: the tray reads nothing
+Until `wadb install` has run, the icon stays detached and the menu says so: the tray reads nothing
 from a port that is not ours. To start it with your session, add `wadb tray` to your desktop's
 autostart by hand; it can start before the panel does and registers when the panel comes up. A
 session with no StatusNotifier host, such as a bare X session with no panel, shows nothing, and

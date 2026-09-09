@@ -290,6 +290,26 @@ impl WadbTray {
         }
     }
 
+    /// An adb action panicked. Write why, and clear `busy` — the whole point of the guard, since
+    /// a latched flag disables Reconnect and Take over for the life of the process. No snapshot is
+    /// applied: on this path the snapshot is what failed.
+    fn recover_from_action_panic(&mut self, panic: &(dyn std::any::Any + Send)) {
+        self.outcome = Some(outcome_line(&format!(
+            "action failed: {}",
+            panic_msg(panic)
+        )));
+        self.busy = false;
+    }
+
+    /// The refresh panicked. Keep everything on screen — a stale reading beats an empty panel —
+    /// and say so. `busy` is not touched: the refresh never owned it.
+    fn recover_from_refresh_panic(&mut self, panic: &(dyn std::any::Any + Send)) {
+        self.outcome = Some(outcome_line(&format!(
+            "refresh failed: {}",
+            panic_msg(panic)
+        )));
+    }
+
     fn takeover_offered(&self) -> bool {
         matches!(self.owner, PortOwner::Foreign | PortOwner::HeldUnknown)
             && self.unit != UnitState::NotInstalled
@@ -481,14 +501,7 @@ fn perform(action: Action, handle: Handle<WadbTray>) {
                 tray.outcome = Some(outcome_line(&outcome));
                 tray.busy = false;
             }),
-            // Outcome-only on this path: the snapshot is what failed, so there is none to apply.
-            Err(panic) => handle.update(|tray| {
-                tray.outcome = Some(outcome_line(&format!(
-                    "action failed: {}",
-                    panic_msg(panic.as_ref())
-                )));
-                tray.busy = false;
-            }),
+            Err(panic) => handle.update(|tray| tray.recover_from_action_panic(panic.as_ref())),
         };
     });
 }
@@ -534,12 +547,9 @@ pub fn run() -> Result<()> {
                 let refreshed = std::panic::catch_unwind(AssertUnwindSafe(snapshot));
                 let update = match refreshed {
                     Ok(snapshot) => handle.update(|tray| tray.apply(snapshot)),
-                    Err(panic) => handle.update(|tray| {
-                        tray.outcome = Some(outcome_line(&format!(
-                            "refresh failed: {}",
-                            panic_msg(panic.as_ref())
-                        )));
-                    }),
+                    Err(panic) => {
+                        handle.update(|tray| tray.recover_from_refresh_panic(panic.as_ref()))
+                    }
                 };
                 // None: the service is gone, which means the session bus is. Same as Quit.
                 if update.is_none() {
@@ -571,6 +581,16 @@ mod tests {
             PortOwner::HeldUnknown,
             PortOwner::Nobody,
         ]
+    }
+
+    /// Panic on purpose and hand back the payload, without the default hook printing a backtrace
+    /// into the test output.
+    fn caught_panic(message: &'static str) -> Box<dyn std::any::Any + Send> {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let payload = std::panic::catch_unwind(|| -> String { panic!("{}", message) }).unwrap_err();
+        std::panic::set_hook(previous);
+        payload
     }
 
     fn tray() -> (WadbTray, Receiver<Action>) {
@@ -861,6 +881,51 @@ mod tests {
         );
         assert!(tray.busy, "Pair never set busy, so it must never clear it");
         assert_eq!(tray.devices.len(), 1, "and it applies no snapshot");
+    }
+
+    #[test]
+    fn an_action_that_panics_frees_the_menu_instead_of_latching_it() {
+        // The guard's whole purpose. Nothing exercised it, so a refactor could have removed the
+        // `busy = false` and every test would still have passed while the menu died on first use.
+        // The panic is real, through catch_unwind, not a hand-made message.
+        let (mut tray, _rx) = tray();
+        tray.busy = true;
+        tray.devices = parse_devices("192.168.86.45:42595 device model:Pixel_8a\n");
+
+        tray.recover_from_action_panic(caught_panic("adb went away").as_ref());
+
+        assert!(!tray.busy, "a latched busy disables the menu for good");
+        assert_eq!(
+            tray.outcome.as_deref(),
+            Some("action failed: adb went away")
+        );
+        assert_eq!(
+            tray.devices.len(),
+            1,
+            "no snapshot: the snapshot is what failed"
+        );
+    }
+
+    #[test]
+    fn a_refresh_that_panics_keeps_what_is_on_screen() {
+        // A panic here would otherwise unwind out of run() and take the icon off the panel, which
+        // is worse than a stale reading.
+        let (mut tray, _rx) = tray();
+        tray.busy = true;
+        tray.devices = parse_devices("192.168.86.45:42595 device model:Pixel_8a\n");
+        let before = tray.devices.clone();
+
+        tray.recover_from_refresh_panic(caught_panic("systemctl vanished").as_ref());
+
+        assert_eq!(tray.devices, before, "the last good reading stays");
+        assert_eq!(
+            tray.outcome.as_deref(),
+            Some("refresh failed: systemctl vanished")
+        );
+        assert!(
+            tray.busy,
+            "the refresh never owned busy, so it must not clear it"
+        );
     }
 
     #[test]
