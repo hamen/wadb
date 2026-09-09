@@ -9,8 +9,14 @@
 //!
 //! Nothing slow runs on the DBus thread. A menu click sends an [`Action`] to the run loop, which
 //! performs it on a thread of its own and writes the outcome back into the tray afterwards.
+//! Opening the TUI is on that list too: choosing a terminal walks several directories and then
+//! waits on the child, which is far too much for a DBus handler.
+
+pub mod icon;
+pub mod terminal;
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
@@ -19,7 +25,7 @@ use anyhow::{anyhow, Result};
 use ksni::blocking::{Handle, TrayMethods};
 use ksni::{
     menu::{MenuItem, StandardItem},
-    Icon, Status, Tray,
+    Category, Icon, Status, Tray,
 };
 
 use crate::adb::{Device, SmartSocket};
@@ -31,44 +37,12 @@ pub const REFRESH: Duration = Duration::from_secs(5);
 /// The outcome line is one menu entry; adb's stderr is not.
 pub const OUTCOME_MAX: usize = 120;
 
-/// What the icon should say at a glance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Health {
-    /// Supervised by our unit, and the port is ours.
-    Supervised,
-    /// Something is up but not ours, or the unit is not running.
-    Degraded,
-    /// No server, or nothing installed.
-    Down,
-}
-
-pub fn health(unit: &UnitState, owner: &PortOwner) -> Health {
-    match (unit, owner) {
-        (UnitState::Active, PortOwner::Ours(_)) => Health::Supervised,
-        (UnitState::NotInstalled, _) | (_, PortOwner::Nobody) => Health::Down,
-        _ => Health::Degraded,
-    }
-}
-
 /// Is a phone usable right now? Only a wireless row in state `device` counts: `offline` is what
 /// adb leaves behind after a drop, and `unauthorized` needs the user, not a reconnect.
 pub fn attached(devices: &[Device]) -> bool {
     devices
         .iter()
         .any(|d| d.transport.is_wireless() && d.state == "device")
-}
-
-/// Themed icon names, so the panel picks the user's own icon theme rather than a bundled bitmap.
-/// The `-symbolic` variants are the ones Adwaita and Yaru actually ship.
-pub fn icon_name(health: Health, attached: bool) -> &'static str {
-    if attached {
-        return "network-wireless-signal-excellent-symbolic";
-    }
-    match health {
-        Health::Supervised => "network-wireless-signal-none-symbolic",
-        Health::Degraded => "network-wireless-acquiring-symbolic",
-        Health::Down => "network-wireless-offline-symbolic",
-    }
 }
 
 /// The first menu line, from the unit and the port owner directly, so it cannot say "not held
@@ -142,48 +116,40 @@ pub fn outcome_line(text: &str) -> String {
     }
 }
 
-/// `$TERMINAL` may carry arguments ("alacritty --command"): the program, then the rest.
-pub fn split_terminal(spec: &str) -> Option<(String, Vec<String>)> {
-    let mut words = spec.split_whitespace().map(str::to_string);
-    let program = words.next()?;
-    Some((program, words.collect()))
-}
-
-fn terminal_candidates() -> Vec<(String, Vec<String>)> {
-    let mut candidates = Vec::new();
-    if let Some(spec) = std::env::var("TERMINAL")
-        .ok()
-        .and_then(|s| split_terminal(&s))
-    {
-        candidates.push(spec);
-    }
-    for name in ["x-terminal-emulator", "kitty", "xterm"] {
-        candidates.push((name.to_string(), Vec::new()));
-    }
-    candidates
-}
-
-/// Open the TUI in a terminal, which is where pairing lives: the QR needs a text grid, and a menu
-/// cannot draw one. `<terminal> [args] -e <this binary>` is assumed to work, as it does for
-/// xterm, kitty, and the Debian alternatives wrapper.
-fn open_tui() -> Result<()> {
+/// Open the TUI, which is where pairing lives: the QR needs a text grid, and a menu cannot draw
+/// one. Returns a note when there is something the user should be told about how it opened.
+fn open_tui() -> Result<Option<String>> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("wadb"));
-    for (program, args) in terminal_candidates() {
-        let spawned = std::process::Command::new(&program)
-            .args(&args)
-            .arg("-e")
-            .arg(&exe)
-            .spawn();
-        if let Ok(mut child) = spawned {
-            // Reap it, or a closed terminal leaves a zombie for the life of the tray. Its exit
-            // status says nothing: a terminal the user closes can exit non-zero too.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            return Ok(());
-        }
+    terminal::open(&exe)
+}
+
+/// One `daemon::tick` in a line a menu can show.
+///
+/// 0/0 says no more than "nothing to reconnect" on purpose: `tick` returns it both when every
+/// advertised phone is already attached and when the mDNS browse found nothing at all because the
+/// phone is off, and `Outcome` cannot tell the two apart.
+pub fn reconnect_outcome(result: &Result<crate::daemon::Outcome>) -> String {
+    let outcome = match result {
+        Err(e) => return format!("reconnect failed: {e:#}"),
+        Ok(outcome) => outcome,
+    };
+    let (connected, failed) = (outcome.connected.len(), outcome.failed.len());
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    match (connected, failed) {
+        (0, 0) => "nothing to reconnect".to_string(),
+        (n, 0) => format!("reconnected {n} device{}", plural(n)),
+        // `failed` holds "{endpoint}: {error}", not serials.
+        (0, m) => format!(
+            "could not connect {m} device{}: {}",
+            plural(m),
+            outcome
+                .failed
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default()
+        ),
+        (n, m) => format!("reconnected {n}, could not connect {m}"),
     }
-    Err(anyhow!("no terminal found; set $TERMINAL"))
 }
 
 /// What a menu click asks the run loop to do.
@@ -191,7 +157,18 @@ fn open_tui() -> Result<()> {
 pub enum Action {
     Reconnect,
     Takeover,
+    /// Open the TUI. Not an adb action: it does not take `busy`, and two are allowed at once.
+    Pair,
     Quit,
+}
+
+impl Action {
+    /// Reconnect and Take over touch the adb server, so they run one at a time. Pair opens a
+    /// terminal, which is neither exclusive nor slow enough to be worth blocking, and Quit must
+    /// be honoured even mid-action.
+    fn guarded(self) -> bool {
+        matches!(self, Action::Reconnect | Action::Takeover)
+    }
 }
 
 /// One refresh's worth of reading, gathered outside the tray lock so a slow server cannot
@@ -280,24 +257,22 @@ impl WadbTray {
         }
     }
 
-    pub fn health(&self) -> Health {
-        health(&self.unit, &self.owner)
-    }
-
     pub fn attached(&self) -> bool {
         attached(&self.devices)
     }
 
     /// Hand an action to the run loop. A second Reconnect or Take over while one runs is ignored,
-    /// not queued; Quit is always honoured.
+    /// not queued. Pair and Quit are always sent: Pair is not an adb action, and swallowing it
+    /// would mean a click that does nothing at all for the half-minute a reconnect can take.
     pub fn request(&mut self, action: Action) {
-        if action != Action::Quit {
-            if self.busy {
-                return;
-            }
+        if action.guarded() && self.busy {
+            return;
+        }
+        // Set only once the send has succeeded. A dropped receiver means the run loop is gone, and
+        // latching `busy` on the way out would leave the menu permanently disabled.
+        if self.actions.send(action).is_ok() && action.guarded() {
             self.busy = true;
         }
-        let _ = self.actions.send(action);
     }
 
     fn header(&self) -> String {
@@ -336,12 +311,20 @@ impl Tray for WadbTray {
         "wadb".into()
     }
 
+    /// Empty, and it has to stay empty. A StatusNotifierItem host prefers `IconName` whenever
+    /// its theme resolves the name, so any theme name here would win over the drawn pixmap — and
+    /// the names this once used are the panel's own Wi-Fi glyphs.
     fn icon_name(&self) -> String {
-        icon_name(self.health(), self.attached()).into()
+        String::new()
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        Vec::new()
+        icon::pixmaps(self.attached())
+    }
+
+    /// The item reports on an attached device, not on communications or a system service.
+    fn category(&self) -> Category {
+        Category::Hardware
     }
 
     fn status(&self) -> Status {
@@ -360,8 +343,10 @@ impl Tray for WadbTray {
                 &self.devices,
                 self.outcome.as_deref(),
             ),
-            icon_name: icon_name(self.health(), self.attached()).into(),
-            icon_pixmap: Vec::new(),
+            // Empty for the same reason as `icon_name` above: this is the second place a theme
+            // name would beat the pixmap.
+            icon_name: String::new(),
+            icon_pixmap: icon::pixmaps(self.attached()),
         }
     }
 
@@ -385,12 +370,7 @@ impl Tray for WadbTray {
         items.push(
             StandardItem {
                 label: "Open wadb to pair…".into(),
-                activate: Box::new(|tray: &mut Self| {
-                    if let Err(e) = open_tui() {
-                        eprintln!("wadb: {e}");
-                        tray.outcome = Some(outcome_line(&e.to_string()));
-                    }
-                }),
+                activate: Box::new(|tray: &mut Self| tray.request(Action::Pair)),
                 ..Default::default()
             }
             .into(),
@@ -441,18 +421,7 @@ fn reconnect(port: u16) -> String {
         return "port is no longer ours".to_string();
     }
     let mut failures = HashMap::new();
-    match crate::daemon::tick(port, &mut failures) {
-        Ok(outcome) => {
-            let connected = outcome.connected.len();
-            let failed = outcome.failed.len();
-            match (connected, failed) {
-                (0, 0) => "nothing to reconnect".to_string(),
-                (n, 0) => format!("reconnected {n} device{}", if n == 1 { "" } else { "s" }),
-                (n, m) => format!("reconnected {n}, {m} failed: {}", outcome.failed.join("; ")),
-            }
-        }
-        Err(e) => format!("reconnect failed: {e:#}"),
-    }
+    reconnect_outcome(&crate::daemon::tick(port, &mut failures))
 }
 
 fn takeover(adb: Option<&PathBuf>, port: u16) -> String {
@@ -465,25 +434,70 @@ fn takeover(adb: Option<&PathBuf>, port: u16) -> String {
     }
 }
 
-/// Run one action on its own thread, then write the fresh state and the outcome back in one
+/// Open the TUI, off the DBus thread. It writes no state and clears no flag: it is not an adb
+/// action, so nothing it does changes the unit, the port or the device list. It writes the
+/// outcome line only when it fails, so opening a terminal does not wipe a reconnect result the
+/// user has not read yet.
+fn perform_pair(handle: Handle<WadbTray>) {
+    std::thread::spawn(move || {
+        let note = match open_tui() {
+            Ok(None) => return,
+            Ok(Some(note)) => note,
+            Err(e) => {
+                eprintln!("wadb: {e:#}");
+                format!("{e:#}")
+            }
+        };
+        handle.update(|tray| tray.outcome = Some(outcome_line(&note)));
+    });
+}
+
+/// Run one adb action on its own thread, then write the fresh state and the outcome back in one
 /// update. `busy` clears here and nowhere else.
 fn perform(action: Action, handle: Handle<WadbTray>) {
     std::thread::spawn(move || {
-        // Resolved now, not when the menu was built: up to a refresh can pass between the two.
-        let port = crate::port();
-        let adb = crate::adb_for_commands().ok();
-        let outcome = match action {
-            Action::Reconnect => reconnect(port),
-            Action::Takeover => takeover(adb.as_ref(), port),
-            Action::Quit => return,
+        // The snapshot is inside the guard, not just the action: it shells out to systemctl and
+        // ss, so it is at least as likely to panic as the action is, and a panic on either side
+        // would leave `busy` set and the menu dead for the life of the process.
+        let done = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            // Resolved now, not when the menu was built: up to a refresh can pass between the two.
+            let port = crate::port();
+            let adb = crate::adb_for_commands().ok();
+            let outcome = match action {
+                Action::Reconnect => reconnect(port),
+                Action::Takeover => takeover(adb.as_ref(), port),
+                Action::Pair | Action::Quit => unreachable!("not an adb action"),
+            };
+            (snapshot(), outcome)
+        }));
+        // `None` from update() means the service is gone — Quit, or the bus went away while the
+        // action ran. Return quietly rather than panicking on it.
+        let _ = match done {
+            Ok((snapshot, outcome)) => handle.update(|tray| {
+                tray.apply(snapshot);
+                tray.outcome = Some(outcome_line(&outcome));
+                tray.busy = false;
+            }),
+            // Outcome-only on this path: the snapshot is what failed, so there is none to apply.
+            Err(panic) => handle.update(|tray| {
+                tray.outcome = Some(outcome_line(&format!(
+                    "action failed: {}",
+                    panic_msg(&panic)
+                )));
+                tray.busy = false;
+            }),
         };
-        let snapshot = snapshot();
-        handle.update(|tray| {
-            tray.apply(snapshot);
-            tray.outcome = Some(outcome_line(&outcome));
-            tray.busy = false;
-        });
     });
+}
+
+fn panic_msg(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panicked".to_string()
+    }
 }
 
 /// Run the tray until the user quits it.
@@ -503,11 +517,24 @@ pub fn run() -> Result<()> {
                 handle.shutdown().wait();
                 return Ok(());
             }
+            Ok(Action::Pair) => perform_pair(handle.clone()),
             Ok(action) => perform(action, handle.clone()),
             Err(RecvTimeoutError::Timeout) => {
-                let snapshot = snapshot();
+                // Guarded for the same reason as the action thread's, and a stronger one: a panic
+                // here unwinds out of run() and the icon leaves the panel altogether, which is
+                // worse than any stale reading. On a panic, keep what is on screen and say so.
+                let refreshed = std::panic::catch_unwind(AssertUnwindSafe(snapshot));
+                let update = match refreshed {
+                    Ok(snapshot) => handle.update(|tray| tray.apply(snapshot)),
+                    Err(panic) => handle.update(|tray| {
+                        tray.outcome = Some(outcome_line(&format!(
+                            "refresh failed: {}",
+                            panic_msg(&panic)
+                        )));
+                    }),
+                };
                 // None: the service is gone, which means the session bus is. Same as Quit.
-                if handle.update(|tray| tray.apply(snapshot)).is_none() {
+                if update.is_none() {
                     return Ok(());
                 }
             }
@@ -559,17 +586,9 @@ mod tests {
     }
 
     #[test]
-    fn health_and_header_cover_every_pair() {
+    fn the_header_covers_every_pair() {
         for unit in &UNITS {
             for owner in owners() {
-                let h = health(unit, &owner);
-                let expected = match (unit, &owner) {
-                    (UnitState::Active, PortOwner::Ours(_)) => Health::Supervised,
-                    (UnitState::NotInstalled, _) | (_, PortOwner::Nobody) => Health::Down,
-                    _ => Health::Degraded,
-                };
-                assert_eq!(h, expected, "{unit:?} {owner:?}");
-
                 let text = header(unit, &owner, 5137);
                 assert!(!text.is_empty());
                 match (unit, &owner) {
@@ -600,6 +619,11 @@ mod tests {
         assert!(!attached(&[]));
         let offline = parse_devices("adb-X-y._adb-tls-connect._tcp offline model:Tab_S9\n");
         assert!(!attached(&offline), "offline is what a drop leaves behind");
+        let unauthorized = parse_devices("192.168.86.45:42595 unauthorized model:Pixel_8a\n");
+        assert!(
+            !attached(&unauthorized),
+            "unauthorized needs the user, not a reconnect"
+        );
         let usb = parse_devices("3A081FDJH00123 device model:Pixel_8a\n");
         assert!(
             !attached(&usb),
@@ -610,26 +634,30 @@ mod tests {
     }
 
     #[test]
-    fn four_icons_and_attached_wins() {
-        let names: std::collections::HashSet<&str> = [
-            icon_name(Health::Supervised, true),
-            icon_name(Health::Supervised, false),
-            icon_name(Health::Degraded, false),
-            icon_name(Health::Down, false),
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(
-            names.len(),
-            4,
-            "a state that looks like another is not worth showing"
-        );
-        assert_eq!(
-            icon_name(Health::Degraded, true),
-            icon_name(Health::Supervised, true),
-            "a phone on a foreign server is still a phone"
-        );
-        assert!(names.iter().all(|n| n.ends_with("-symbolic")));
+    fn no_icon_name_is_ever_offered() {
+        // A StatusNotifierItem host prefers IconName over IconPixmap whenever its theme resolves
+        // the name, so a name here would beat the drawn phone. This is the assertion that keeps
+        // the panel's own Wi-Fi glyph off the tray.
+        let (mut tray, _rx) = tray();
+        tray.devices = parse_devices("192.168.86.45:42595 device model:Pixel_8a\n");
+        assert_eq!(tray.icon_name(), "");
+        assert_eq!(tray.tool_tip().icon_name, "");
+        assert!(!tray.icon_pixmap().is_empty());
+        assert!(!tray.tool_tip().icon_pixmap.is_empty());
+    }
+
+    #[test]
+    fn the_icon_follows_whether_a_phone_is_attached() {
+        let bytes = |t: &WadbTray| {
+            t.icon_pixmap()
+                .into_iter()
+                .map(|i| i.data)
+                .collect::<Vec<_>>()
+        };
+        let (mut tray, _rx) = tray();
+        let detached = bytes(&tray);
+        tray.devices = parse_devices("192.168.86.45:42595 device model:Pixel_8a\n");
+        assert_ne!(bytes(&tray), detached);
     }
 
     #[test]
@@ -675,16 +703,6 @@ mod tests {
         assert!(cut.ends_with('…'));
         assert_eq!(cut.chars().count(), OUTCOME_MAX + 1);
         assert_eq!(outcome_line(""), "");
-    }
-
-    #[test]
-    fn terminal_spec_splits_into_program_and_arguments() {
-        assert_eq!(
-            split_terminal("alacritty --command"),
-            Some(("alacritty".into(), vec!["--command".into()]))
-        );
-        assert_eq!(split_terminal("kitty"), Some(("kitty".into(), vec![])));
-        assert_eq!(split_terminal("   "), None);
     }
 
     #[test]
@@ -769,6 +787,75 @@ mod tests {
         // Quit is exempt.
         (standard(&menu, "Quit").unwrap().activate)(&mut tray);
         assert_eq!(rx.try_recv(), Ok(Action::Quit));
+    }
+
+    #[test]
+    fn pair_is_exempt_from_busy_in_both_directions() {
+        // Both halves matter, and satisfying only one breaks something. If Pair *set* `busy` it
+        // would disable Reconnect and show "working…" for opening a terminal. If Pair were
+        // *ignored* while busy, a click during a reconnect - the half-minute when a user is most
+        // likely to reach for pairing - would do nothing at all, silently.
+        let (mut tray, rx) = tray();
+        let menu = tray.menu();
+        (standard(&menu, "Open wadb to pair").unwrap().activate)(&mut tray);
+        assert_eq!(rx.try_recv(), Ok(Action::Pair));
+        assert!(!tray.busy, "opening a terminal is not an adb action");
+
+        tray.busy = true;
+        let menu = tray.menu();
+        (standard(&menu, "Open wadb to pair").unwrap().activate)(&mut tray);
+        assert_eq!(rx.try_recv(), Ok(Action::Pair), "sent even while busy");
+        assert!(tray.busy, "and it must not clear the flag either");
+    }
+
+    #[test]
+    fn a_dropped_run_loop_does_not_latch_the_menu_shut() {
+        // `busy` is set only once the send has succeeded. A dropped receiver means the run loop is
+        // gone; latching the flag on the way out would leave the menu permanently disabled.
+        let (mut tray, rx) = tray();
+        drop(rx);
+        tray.request(Action::Reconnect);
+        assert!(!tray.busy);
+    }
+
+    #[test]
+    fn reconnect_outcome_says_what_actually_happened() {
+        use crate::daemon::Outcome;
+        let outcome = |connected: &[&str], failed: &[&str]| {
+            Ok(Outcome {
+                connected: connected.iter().map(|s| s.to_string()).collect(),
+                failed: failed.iter().map(|s| s.to_string()).collect(),
+            })
+        };
+        // 0/0 says no more than this on purpose: `tick` returns it both when every advertised
+        // phone is already attached and when the browse found nothing because the phone is off,
+        // and Outcome cannot tell the two apart. The older, friendlier wording was a lie in the
+        // commoner of the two cases.
+        assert_eq!(
+            reconnect_outcome(&outcome(&[], &[])),
+            "nothing to reconnect"
+        );
+        assert_eq!(
+            reconnect_outcome(&outcome(&["a"], &[])),
+            "reconnected 1 device"
+        );
+        assert_eq!(
+            reconnect_outcome(&outcome(&["a", "b"], &[])),
+            "reconnected 2 devices"
+        );
+        // `failed` holds "{endpoint}: {error}", not serials.
+        assert_eq!(
+            reconnect_outcome(&outcome(&[], &["192.168.86.45:42595: timed out"])),
+            "could not connect 1 device: 192.168.86.45:42595: timed out"
+        );
+        assert_eq!(
+            reconnect_outcome(&outcome(&["a"], &["b: x", "c: y"])),
+            "reconnected 1, could not connect 2"
+        );
+        assert_eq!(
+            reconnect_outcome(&Err(anyhow!("mDNS browse failed"))),
+            "reconnect failed: mDNS browse failed"
+        );
     }
 
     #[test]

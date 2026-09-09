@@ -403,6 +403,15 @@ pub(crate) mod test_support {
             std::env::set_var(key, value);
         }
 
+        /// Unset a variable for the duration of the test. Needed to prove the XDG *defaults*:
+        /// pointing the variables at temporary directories never exercises the branch that runs
+        /// when a session exports none of them, which is the branch that silently sends the
+        /// search to the wrong terminal.
+        pub fn remove(&mut self, key: &str) {
+            self.remember(key);
+            std::env::remove_var(key);
+        }
+
         fn remember(&mut self, key: &str) {
             if !self.saved.iter().any(|(k, _)| k == key) {
                 self.saved.push((key.to_string(), std::env::var(key).ok()));

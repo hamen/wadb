@@ -93,21 +93,59 @@ wadb pair 192.168.86.45:37219    # ip:port from the phone's Wireless debugging s
 
 `wadb tray` puts an icon in the panel, so you can see whether the phone is attached without
 opening a terminal. It is a StatusNotifierItem on the session bus, which XFCE 4.16 and later,
-KDE Plasma, and GNOME with the AppIndicator extension all show. Verified on XFCE 4.20.
+KDE Plasma, and GNOME with the AppIndicator extension all show. Verified by hand on XFCE 4.20
+only; the other two are reasoned from the specification, not tested, and the icon is sent as a
+pixmap, which is the fallback every host implements.
 
-The icon answers one question, *is a phone attached?*, and when the answer is no it says why:
-signal bars when a wireless device is attached, none when the server is supervised and nothing is
-on it, an acquiring glyph when something other than the unit holds the port, and offline when the
-server is down or `wadb` is not installed. A left click opens the menu:
+The icon answers one question, *is a phone attached?* It is a phone, drawn by wadb rather than
+taken from your icon theme, with its screen lit and green when a wireless device is attached and
+dark and grey when none is. Why nothing is attached is in the tooltip and the first menu line,
+in words.
+
+It is drawn rather than themed for two reasons. Asking the theme for the obvious names would put
+`network-wireless-*` on your panel, which is what your network indicator already shows — one of
+those next to the other is genuinely misleading. And no icon theme ships a phone with an on/off
+pair: elementary-xfce, Adwaita and Yaru all have `phone-symbolic` and friends, and at 22 px they
+are the same slab. A drawn icon does not follow your theme's colours, so the two are mid-tone and
+meant to read on a light panel and a dark one.
+
+A left click opens the menu:
 
 - the unit's state, and the outcome of the last action you ran from the menu
 - one line per wireless device, with `(offline)` or `(unauthorized)` when adb says so
-- **Open wadb to pair…** opens the terminal UI; press `p` there. The terminal comes from
-  `$TERMINAL` (arguments allowed, as in `alacritty --command`), then `x-terminal-emulator`, `kitty`
-  and `xterm`, and is asked to run `-e <path to wadb>`
+- **Open wadb to pair…** opens the terminal UI; press `p` there. See *Which terminal* below
 - **Reconnect now** does one pass of the watcher, ignoring any backoff
 - **Take over the port**, shown when another adb holds the port and the unit is installed
 - **Quit**
+
+### Which terminal, and how big
+
+The terminal UI needs 78x30 to draw the pairing QR, and below that it says so instead. Opening it
+from a menu should not need you to resize a window first, so wadb asks for 80x32 — and to ask, it
+has to know which terminal it is talking to.
+
+It takes the first of these that works:
+
+1. `$TERMINAL`. Arguments are allowed. If the last word is `-e`, `-x`, `--command` or `--`, wadb
+   takes that as you having written the invocation yourself and appends only the path to `wadb` —
+   no size arguments, no second separator.
+2. Your desktop's own record: `xdg-terminals.list`, per the freedesktop Default Terminal Execution
+   specification, searched under `$XDG_CONFIG_HOME` and `$XDG_CONFIG_DIRS`, with the desktop-specific
+   file preferred. This is where a preference set once actually lives, which is why it outranks the
+   next two.
+3. `x-terminal-emulator`, when the alternative resolves to a terminal wadb can size.
+4. kitty, alacritty, foot, xfce4-terminal, konsole, gnome-terminal, xterm — the ones whose size
+   flags wadb knows.
+5. `x-terminal-emulator` otherwise, unsized.
+
+Note that `x-terminal-emulator` is a *distribution* alternative rather than your preference. On a
+Debian-family machine it is usually GNOME Terminal by package priority, whatever else you have
+installed, which is why it is not tried first.
+
+The size is a request. A tiling window manager ignores it, and so does any terminal not in the
+list above — the "terminal too small" screen is the backstop. **GNOME Terminal cannot be sized from
+the command line at all**: `--geometry` has been deprecated since 3.28 and is ignored, so if that
+is your terminal, raise the size in its profile or point `$TERMINAL` somewhere else.
 
 Until `wadb install` has run, the icon stays offline and the menu says so: the tray reads nothing
 from a port that is not ours. To start it with your session, add `wadb tray` to your desktop's

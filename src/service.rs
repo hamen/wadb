@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::adb::{self, MdnsSupport, SmartSocket, DEFAULT_PORT};
 
@@ -547,7 +547,14 @@ pub fn takeover_given(
     let mut lines = vec!["asked the foreign server to stop.".to_string()];
 
     if unit_installed {
-        restart()?;
+        // Not a bare `?`. By this point the foreign server has already been stopped, and losing
+        // that half of the story leaves the caller reporting only that the restart failed - so a
+        // user reads "restarting the unit failed" and does not learn that nothing is on the port
+        // any more. The CLI used to print the first line before attempting the restart; returning
+        // the lines at the end means this path has to carry both facts itself.
+        restart().map_err(|e| {
+            anyhow!("asked the foreign server to stop, but restarting the unit failed: {e:#}")
+        })?;
         match wait_for_ownership(port, std::time::Duration::from_secs(5)) {
             PortOwner::Ours(pid) => {
                 lines.push(format!("the unit now owns port {port}, pid {pid}."))
