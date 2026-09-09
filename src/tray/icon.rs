@@ -193,7 +193,7 @@ mod tests {
                 assert_eq!(icon.width, size as i32);
                 assert_eq!(icon.height, size as i32);
                 assert_eq!(icon.data.len(), (size * size * 4) as usize);
-                for chunk in icon.data.chunks_exact(4) {
+                for chunk in icon.data.as_chunks::<4>().0 {
                     assert!(
                         chunk[0] == 0 || chunk[0] == 0xFF,
                         "size {size}: alpha {} is neither clear nor opaque",
