@@ -86,7 +86,34 @@ wadb pair 192.168.86.45:37219    # ip:port from the phone's Wireless debugging s
 | `wadb connect` | reconnect every advertised device once, by hand |
 | `wadb daemon` | the reconnect watcher; this is what `wadb-connect.service` runs |
 | `wadb takeover` | ask a foreign adb server to stop so the unit can take the port |
+| `wadb tray` | a panel icon: is a phone attached, the device list, pairing and reconnect |
 | `wadb uninstall` | stop and remove both units |
+
+## Panel icon
+
+`wadb tray` puts an icon in the panel, so you can see whether the phone is attached without
+opening a terminal. It is a StatusNotifierItem on the session bus, which XFCE 4.16 and later,
+KDE Plasma, and GNOME with the AppIndicator extension all show. Verified on XFCE 4.20.
+
+The icon answers one question, *is a phone attached?*, and when the answer is no it says why:
+signal bars when a wireless device is attached, none when the server is supervised and nothing is
+on it, an acquiring glyph when something other than the unit holds the port, and offline when the
+server is down or `wadb` is not installed. A left click opens the menu:
+
+- the unit's state, and the outcome of the last action you ran from the menu
+- one line per wireless device, with `(offline)` or `(unauthorized)` when adb says so
+- **Open wadb to pair…** opens the terminal UI; press `p` there. The terminal comes from
+  `$TERMINAL` (arguments allowed, as in `alacritty --command`), then `x-terminal-emulator`, `kitty`
+  and `xterm`, and is asked to run `-e <path to wadb>`
+- **Reconnect now** does one pass of the watcher, ignoring any backoff
+- **Take over the port**, shown when another adb holds the port and the unit is installed
+- **Quit**
+
+Until `wadb install` has run, the icon stays offline and the menu says so: the tray reads nothing
+from a port that is not ours. To start it with your session, add `wadb tray` to your desktop's
+autostart by hand; it can start before the panel does and registers when the panel comes up. A
+session with no StatusNotifier host, such as a bare X session with no panel, shows nothing, and
+two `wadb tray` processes show two icons.
 
 ## Why the adb binary matters
 

@@ -50,7 +50,7 @@ enum Command {
     Connect,
     /// Run the reconnect watcher. This is what `wadb-connect.service` runs.
     Daemon,
-    /// Show a status-bar icon with the device list, for panels that speak StatusNotifierItem.
+    /// Show a panel icon with the device list, for panels that speak StatusNotifierItem.
     Tray,
 }
 
@@ -79,7 +79,7 @@ fn main() -> Result<()> {
         Some(Command::Takeover) => takeover(),
         Some(Command::Connect) => connect_once(),
         Some(Command::Daemon) => daemon::run(port()),
-        Some(Command::Tray) => tray::run(port(), adb_for_commands().ok()),
+        Some(Command::Tray) => tray::run(),
         None => tui(),
     }
 }
@@ -330,45 +330,8 @@ fn pair_manually(endpoint: &str) -> Result<()> {
 fn takeover() -> Result<()> {
     let port = port();
     let adb_path = adb_for_commands()?;
-    match service::port_owner(port) {
-        PortOwner::Ours(pid) => {
-            println!("port {port} is already ours (pid {pid}); nothing to do.");
-            return Ok(());
-        }
-        PortOwner::Nobody => {
-            println!("nothing is holding port {port}.");
-            return Ok(());
-        }
-        PortOwner::Foreign | PortOwner::HeldUnknown => {}
-    }
-
-    // A cooperative request, not a kill: we never signal a process we do not own.
-    // The socket is pinned explicitly, or an inherited ADB_SERVER_SOCKET could send this
-    // to a different server than the one we just checked.
-    let out = std::process::Command::new(&adb_path)
-        .env("ADB_SERVER_SOCKET", format!("tcp:127.0.0.1:{port}"))
-        .env_remove("ANDROID_ADB_SERVER_PORT")
-        .arg("kill-server")
-        .output()?;
-    if !out.status.success() {
-        bail!(
-            "adb kill-server failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    println!("asked the foreign server to stop.");
-
-    if service::installed_unit().is_some() {
-        service::restart()?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if let PortOwner::Ours(pid) = service::port_owner(port) {
-                println!("the unit now owns port {port}, pid {pid}.");
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        println!("restarted the unit, but it has not taken the port yet.");
+    for line in service::takeover(&adb_path, port)? {
+        println!("{line}");
     }
     Ok(())
 }
@@ -410,4 +373,51 @@ fn tui() -> Result<()> {
     let mut app = ui::App::new(port(), adb_for_commands().ok(), unit_state());
     app.refresh();
     ui::run(&mut app)
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serialises the tests that touch the process environment: `set_var` is visible to every
+    /// other test running in parallel.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Holds the lock, and restores every variable it set or removed when dropped, panic
+    /// included.
+    pub struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        pub fn lock() -> Self {
+            Self {
+                _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+                saved: Vec::new(),
+            }
+        }
+
+        pub fn set(&mut self, key: &str, value: &str) {
+            self.remember(key);
+            std::env::set_var(key, value);
+        }
+
+        fn remember(&mut self, key: &str) {
+            if !self.saved.iter().any(|(k, _)| k == key) {
+                self.saved.push((key.to_string(), std::env::var(key).ok()));
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..).rev() {
+                match value {
+                    Some(v) => std::env::set_var(&key, v),
+                    None => std::env::remove_var(&key),
+                }
+            }
+        }
+    }
 }
