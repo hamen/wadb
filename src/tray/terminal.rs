@@ -51,18 +51,27 @@ pub fn size() -> (u16, u16) {
 }
 
 /// The program name a table row is keyed on.
-///
-/// A Debian `*.wrapper` is deliberately **not** unwrapped to its target. Those scripts implement
-/// the xterm convention (`-geometry WxH`, `-e cmd`) rather than the convention of the terminal
-/// they exec, so driving `gnome-terminal.wrapper` with gnome-terminal's own flags would have it
-/// silently drop every argument, including the command, and open a bare shell — exit 0, no TUI,
-/// and nothing for the settle check below to notice. Left alone, a wrapper matches no row, so it
-/// gets no size arguments and the `-e` it does understand.
 pub fn basename(program: &str) -> &str {
     Path::new(program)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(program)
+}
+
+/// The terminal a Debian `*.wrapper` script actually execs.
+///
+/// These scripts are not thin: they implement the **xterm** command line (`-geometry WxH`,
+/// `-e cmd`) and translate it into their target's own flags. So a wrapper must be driven by
+/// xterm's syntax, never by its target's — handing `xfce4-terminal.wrapper` the
+/// `--geometry=80x32 -x <exe>` that `xfce4-terminal` itself wants would have the wrapper's
+/// argument loop match none of the three, drop all of them **including the command**, and open a
+/// bare shell: exit 0, no TUI, and nothing for the settle check to notice.
+///
+/// The target still decides whether sizing is worth attempting, which is why this returns the name
+/// rather than a bool: `gnome-terminal.wrapper` faithfully translates `-geometry` into a
+/// `--geometry` that GNOME Terminal has ignored since 3.28, so sizing it is theatre.
+fn wrapper_target(program: &str) -> Option<&str> {
+    basename(program).strip_suffix(".wrapper")
 }
 
 /// How to ask this terminal for a `cols` by `rows` window. An empty list means "this terminal
@@ -71,8 +80,22 @@ pub fn basename(program: &str) -> &str {
 /// Verified on this machine: kitty and xfce4-terminal. The rest are from each terminal's own
 /// documentation, which is why a rejected argument list is retried without it rather than trusted.
 pub fn size_args(program: &str, cols: u16, rows: u16) -> Vec<String> {
+    if let Some(target) = wrapper_target(program) {
+        // xterm's syntax, because that is what the wrapper parses - but only when the terminal
+        // behind it can be sized at all. Otherwise this would hand `x-terminal-emulator` a size it
+        // silently discards, and step 3 would then prefer an unsizable GNOME Terminal over an
+        // installed, sizable kitty.
+        return match row_size_args(target, cols, rows).is_empty() {
+            true => Vec::new(),
+            false => vec!["-geometry".into(), format!("{cols}x{rows}")],
+        };
+    }
+    row_size_args(basename(program), cols, rows)
+}
+
+fn row_size_args(name: &str, cols: u16, rows: u16) -> Vec<String> {
     let arg = |s: String| s;
-    match basename(program) {
+    match name {
         // remember_window_size defaults to yes and then *overrides* initial_window_*, so without
         // it kitty reopens at whatever size it was last dragged to.
         "kitty" => vec![
@@ -110,6 +133,10 @@ pub fn size_args(program: &str, cols: u16, rows: u16) -> Vec<String> {
 /// `-e` is not universal, and assuming it was is how an earlier version planned to hand
 /// gnome-terminal a deprecated flag.
 pub fn separator(program: &str) -> Option<&'static str> {
+    // A wrapper takes xterm's `-e`, whatever its target would have wanted.
+    if wrapper_target(program).is_some() {
+        return Some("-e");
+    }
     match basename(program) {
         "foot" => None,
         "xfce4-terminal" => Some("-x"),
@@ -597,6 +624,16 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_exec_path_is_skipped_rather_than_mangled() {
+        // Desktop Entry quoting is not implemented, and this is where that shows. Splitting on
+        // whitespace turns `"/usr/bin/my term"` into two words, the second of which is not a field
+        // code - so the entry yields nothing and the search moves on, the same safe outcome as any
+        // other unusable entry. It must not yield the truncated `"/usr/bin/my`.
+        let entry = parse_desktop_entry("[Desktop Entry]\nExec=\"/usr/bin/my term\"\n");
+        assert_eq!(entry.program, None);
+    }
+
+    #[test]
     fn only_the_desktop_entry_group_is_read() {
         let entry = parse_desktop_entry(
             "[Desktop Entry]\n\
@@ -666,14 +703,35 @@ mod tests {
 
     #[test]
     fn a_debian_wrapper_is_driven_by_the_xterm_convention_it_implements() {
-        // /usr/bin/{gnome,xfce4}-terminal.wrapper translate xterm's flags (-geometry, -e) into
-        // their target's. Unwrapping the name and using the target's own flags would have the
-        // wrapper silently drop every argument it did not recognise - including the command - and
-        // open a bare shell: exit 0, no TUI, nothing for the settle check to notice. Left alone, a
-        // wrapper matches no row, so it gets no size arguments and the -e it does understand.
+        // /usr/bin/{gnome,xfce4}-terminal.wrapper parse xterm's flags and translate them into
+        // their target's. Sending the target's own flags instead would have the wrapper match none
+        // of them, drop them all including the command, and open a bare shell: exit 0, no TUI,
+        // nothing for the settle check to notice.
+        assert_eq!(
+            argv(
+                &Candidate::plain("/usr/bin/xfce4-terminal.wrapper"),
+                Path::new("/x/wadb"),
+                &size_args("/usr/bin/xfce4-terminal.wrapper", 80, 32),
+            ),
+            vec![
+                "/usr/bin/xfce4-terminal.wrapper",
+                "-geometry",
+                "80x32",
+                "-e",
+                "/x/wadb",
+            ],
+            "xterm syntax, not xfce4-terminal's --geometry=/-x"
+        );
+    }
+
+    #[test]
+    fn a_wrapper_is_sized_only_when_its_target_can_be() {
+        // The distinction that keeps step 3 honest. xfce4-terminal takes a size, so its wrapper is
+        // worth sizing and a deliberate alternative pointing at it is honoured. GNOME Terminal has
+        // ignored --geometry since 3.28, so its wrapper translates faithfully into something
+        // discarded - and sizing it would make step 3 prefer an unsizable terminal over kitty.
+        assert!(!size_args("xfce4-terminal.wrapper", 80, 32).is_empty());
         assert!(size_args("gnome-terminal.wrapper", 80, 32).is_empty());
-        assert!(size_args("xfce4-terminal.wrapper", 80, 32).is_empty());
-        assert_eq!(separator("xfce4-terminal.wrapper"), Some("-e"));
     }
 
     #[test]
@@ -855,7 +913,9 @@ mod tests {
         let mut env = EnvGuard::lock();
         let f = Fixture::new("skips", &mut env);
         f.program("good");
-        f.user_list("missing.desktop\nprobe.desktop\nwrapped.desktop\ngood.desktop\n");
+        f.user_list(
+            "missing.desktop\nprobe.desktop\nwrapped.desktop\nquoted.desktop\ngood.desktop\n",
+        );
         // A TryExec naming a binary that is not there: the entry should not be shown.
         f.system_entry(
             "probe.desktop",
@@ -863,6 +923,11 @@ mod tests {
         );
         // An Exec that is a wrapper invocation: running its first field alone runs the wrong thing.
         f.system_entry("wrapped.desktop", "[Desktop Entry]\nExec=env FOO=1 good\n");
+        // A quoted path with a space: parsed wrong, so skipped rather than half-run.
+        f.system_entry(
+            "quoted.desktop",
+            "[Desktop Entry]\nExec=\"/usr/bin/my term\"\n",
+        );
         f.system_entry("good.desktop", "[Desktop Entry]\nExec=good\n");
         assert_eq!(f.chosen().first().map(String::as_str), Some("good"));
     }
@@ -973,6 +1038,35 @@ mod tests {
             note.as_deref(),
             Some("$TERMINAL (broken) failed; opened kitty instead")
         );
+    }
+
+    #[test]
+    fn a_candidate_that_fails_sized_and_unsized_hands_over_to_the_next() {
+        // Both attempts dying must not end the search, and must not be reported as a window.
+        let mut env = EnvGuard::lock();
+        let f = Fixture::new("bothfail", &mut env);
+        let log = f.root.join("kitty.log");
+        script(
+            &f.bin.join("kitty"),
+            &format!("echo \"$*\" >> {log}\nexit 1", log = log.display()),
+        );
+        f.program("xterm");
+        env.set("TERMINAL", "kitty");
+
+        let note = open(Path::new("/x/wadb")).unwrap();
+        assert_eq!(
+            note.as_deref(),
+            Some("$TERMINAL (kitty) failed; opened xterm instead")
+        );
+        let calls: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // Sized then unsized, for the $TERMINAL candidate and again for the known-list one.
+        assert_eq!(calls.len(), 4, "each attempt is tried sized, then unsized");
+        assert!(calls[0].contains("-o") && calls[2].contains("-o"));
+        assert!(!calls[1].contains("-o") && !calls[3].contains("-o"));
     }
 
     #[test]

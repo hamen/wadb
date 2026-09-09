@@ -70,14 +70,11 @@ fn device_count(devices: &[Device]) -> String {
 }
 
 /// The text under the icon on hover.
-pub fn tooltip(
-    unit: &UnitState,
-    owner: &PortOwner,
-    port: u16,
-    devices: &[Device],
-    outcome: Option<&str>,
-) -> String {
-    let mut text = format!("{}\n{}", header(unit, owner, port), device_count(devices));
+/// Takes the header rather than deriving it, so that the hover says the same thing the menu does.
+/// It used to call `header()` itself, which meant an action in flight showed "working…" in the
+/// menu and the idle state on hover - two answers to one question.
+pub fn tooltip(header: &str, devices: &[Device], outcome: Option<&str>) -> String {
+    let mut text = format!("{header}\n{}", device_count(devices));
     if let Some(outcome) = outcome {
         text.push('\n');
         text.push_str(outcome);
@@ -283,6 +280,16 @@ impl WadbTray {
         }
     }
 
+    /// What a finished Pair writes: the outcome line, and only when there is something to say.
+    /// Never `busy`, which it never set, and never a snapshot, because opening a terminal changes
+    /// no adb state. A silent success leaves the previous outcome alone, so opening a terminal
+    /// does not wipe a reconnect result the user has not read yet.
+    fn finish_pair(&mut self, note: Option<String>) {
+        if let Some(note) = note {
+            self.outcome = Some(outcome_line(&note));
+        }
+    }
+
     fn takeover_offered(&self) -> bool {
         matches!(self.owner, PortOwner::Foreign | PortOwner::HeldUnknown)
             && self.unit != UnitState::NotInstalled
@@ -336,13 +343,7 @@ impl Tray for WadbTray {
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
             title: "wadb".into(),
-            description: tooltip(
-                &self.unit,
-                &self.owner,
-                self.port,
-                &self.devices,
-                self.outcome.as_deref(),
-            ),
+            description: tooltip(&self.header(), &self.devices, self.outcome.as_deref()),
             // Empty for the same reason as `icon_name` above: this is the second place a theme
             // name would beat the pixmap.
             icon_name: String::new(),
@@ -441,14 +442,15 @@ fn takeover(adb: Option<&PathBuf>, port: u16) -> String {
 fn perform_pair(handle: Handle<WadbTray>) {
     std::thread::spawn(move || {
         let note = match open_tui() {
-            Ok(None) => return,
-            Ok(Some(note)) => note,
+            Ok(note) => note,
             Err(e) => {
                 eprintln!("wadb: {e:#}");
-                format!("{e:#}")
+                Some(format!("{e:#}"))
             }
         };
-        handle.update(|tray| tray.outcome = Some(outcome_line(&note)));
+        if note.is_some() {
+            handle.update(|tray| tray.finish_pair(note));
+        }
     });
 }
 
@@ -504,7 +506,12 @@ fn panic_msg(panic: &Box<dyn std::any::Any + Send>) -> String {
 pub fn run() -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut tray = WadbTray::new(tx);
-    tray.apply(snapshot());
+    // Guarded like the other two calls. This one is before the item exists, so a panic here would
+    // abort the process with a backtrace rather than the one-line error every other startup
+    // failure produces.
+    let first = std::panic::catch_unwind(snapshot)
+        .map_err(|p| anyhow!("could not read the adb server: {}", panic_msg(&p)))?;
+    tray.apply(first);
     // A missing StatusNotifierWatcher at start is not fatal: the item registers when the panel
     // comes up, so this can be launched from a session autostart before the panel.
     let handle = tray
@@ -666,13 +673,20 @@ mod tests {
         let two = parse_devices(
             "192.168.86.45:42595 device model:Pixel_8a\n192.168.86.99:41000 device model:Tab_S9\n",
         );
-        let (unit, owner) = (UnitState::Active, PortOwner::Ours(1));
-        assert!(tooltip(&unit, &owner, 5037, &[], None).ends_with("no wireless devices"));
-        assert!(tooltip(&unit, &owner, 5037, &one, None).ends_with("1 wireless device"));
-        assert!(tooltip(&unit, &owner, 5037, &two, None).ends_with("2 wireless devices"));
-        assert!(tooltip(&unit, &owner, 5037, &two, None).starts_with("Supervised\n"));
-        let with = tooltip(&unit, &owner, 5037, &two, Some("reconnected 1 device"));
+        let head = header(&UnitState::Active, &PortOwner::Ours(1), 5037);
+        assert!(tooltip(&head, &[], None).ends_with("no wireless devices"));
+        assert!(tooltip(&head, &one, None).ends_with("1 wireless device"));
+        assert!(tooltip(&head, &two, None).ends_with("2 wireless devices"));
+        assert!(tooltip(&head, &two, None).starts_with("Supervised\n"));
+        let with = tooltip(&head, &two, Some("reconnected 1 device"));
         assert!(with.ends_with("\nreconnected 1 device"));
+    }
+
+    #[test]
+    fn the_hover_says_what_the_menu_says_while_an_action_runs() {
+        let (mut tray, _rx) = tray();
+        tray.busy = true;
+        assert!(tray.tool_tip().description.starts_with("working…"));
     }
 
     #[test]
@@ -703,6 +717,24 @@ mod tests {
         assert!(cut.ends_with('…'));
         assert_eq!(cut.chars().count(), OUTCOME_MAX + 1);
         assert_eq!(outcome_line(""), "");
+    }
+
+    #[test]
+    fn a_long_multibyte_line_is_cut_on_a_character_not_a_byte() {
+        // The reason the cut counts chars(): a byte index landing mid-character panics, and this
+        // runs inside a DBus handler, where a panic takes the icon off the panel. A phone whose
+        // model name is not ASCII is an ordinary thing, not a corner case.
+        let long = "é".repeat(OUTCOME_MAX + 50);
+        let cut = outcome_line(&long);
+        assert_eq!(cut.chars().count(), OUTCOME_MAX + 1);
+        assert!(cut.ends_with('…'));
+        assert!(
+            cut.len() > cut.chars().count(),
+            "the fixture must be multi-byte"
+        );
+        // Exactly at the limit, nothing is cut and nothing is appended.
+        let exact = "日".repeat(OUTCOME_MAX);
+        assert_eq!(outcome_line(&exact), exact);
     }
 
     #[test]
@@ -806,6 +838,28 @@ mod tests {
         (standard(&menu, "Open wadb to pair").unwrap().activate)(&mut tray);
         assert_eq!(rx.try_recv(), Ok(Action::Pair), "sent even while busy");
         assert!(tray.busy, "and it must not clear the flag either");
+    }
+
+    #[test]
+    fn a_finished_pair_writes_the_outcome_and_nothing_else() {
+        let (mut tray, _rx) = tray();
+        tray.busy = true;
+        tray.devices = parse_devices("192.168.86.45:42595 device model:Pixel_8a\n");
+        tray.outcome = Some("reconnected 1 device".into());
+
+        // A silent success must not wipe a result the user has not read yet.
+        tray.finish_pair(None);
+        assert_eq!(tray.outcome.as_deref(), Some("reconnected 1 device"));
+
+        // Anything worth saying replaces it - and still touches nothing else. If Pair cleared
+        // `busy` here it would re-enable Reconnect while one was still running.
+        tray.finish_pair(Some("no terminal found; set $TERMINAL".into()));
+        assert_eq!(
+            tray.outcome.as_deref(),
+            Some("no terminal found; set $TERMINAL")
+        );
+        assert!(tray.busy, "Pair never set busy, so it must never clear it");
+        assert_eq!(tray.devices.len(), 1, "and it applies no snapshot");
     }
 
     #[test]
