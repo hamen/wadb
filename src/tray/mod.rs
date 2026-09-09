@@ -449,7 +449,8 @@ fn perform_pair(handle: Handle<WadbTray>) {
             }
         };
         if note.is_some() {
-            handle.update(|tray| tray.finish_pair(note));
+            // `None` here means the service is gone, same as on the action path: nothing to do.
+            let _ = handle.update(|tray| tray.finish_pair(note));
         }
     });
 }
@@ -484,7 +485,7 @@ fn perform(action: Action, handle: Handle<WadbTray>) {
             Err(panic) => handle.update(|tray| {
                 tray.outcome = Some(outcome_line(&format!(
                     "action failed: {}",
-                    panic_msg(&panic)
+                    panic_msg(panic.as_ref())
                 )));
                 tray.busy = false;
             }),
@@ -492,7 +493,7 @@ fn perform(action: Action, handle: Handle<WadbTray>) {
     });
 }
 
-fn panic_msg(panic: &Box<dyn std::any::Any + Send>) -> String {
+fn panic_msg(panic: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = panic.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = panic.downcast_ref::<String>() {
@@ -510,7 +511,7 @@ pub fn run() -> Result<()> {
     // abort the process with a backtrace rather than the one-line error every other startup
     // failure produces.
     let first = std::panic::catch_unwind(snapshot)
-        .map_err(|p| anyhow!("could not read the adb server: {}", panic_msg(&p)))?;
+        .map_err(|p| anyhow!("could not read the adb server: {}", panic_msg(p.as_ref())))?;
     tray.apply(first);
     // A missing StatusNotifierWatcher at start is not fatal: the item registers when the panel
     // comes up, so this can be launched from a session autostart before the panel.
@@ -536,7 +537,7 @@ pub fn run() -> Result<()> {
                     Err(panic) => handle.update(|tray| {
                         tray.outcome = Some(outcome_line(&format!(
                             "refresh failed: {}",
-                            panic_msg(&panic)
+                            panic_msg(panic.as_ref())
                         )));
                     }),
                 };

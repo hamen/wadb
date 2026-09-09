@@ -105,15 +105,28 @@ pub fn phone_icon(size: u32, attached: bool) -> Icon {
         inner_w,
         l.stroke,
     );
-    fill(&mut data, size, colour, l.x, l.y, l.stroke, l.h);
+    // The sides stop short at both ends for the same reason, which the first version did not do:
+    // the bars were inset but the sides still ran the full height, so they painted the very
+    // corners the inset was there to clear and the case came out a sharp rectangle. Found in
+    // cross-review by grok45high and opencode, both reading the comment against the code.
+    let inner_h = l.h.saturating_sub(2 * l.stroke);
+    fill(
+        &mut data,
+        size,
+        colour,
+        l.x,
+        l.y + l.stroke,
+        l.stroke,
+        inner_h,
+    );
     fill(
         &mut data,
         size,
         colour,
         l.x + l.w - l.stroke,
-        l.y,
+        l.y + l.stroke,
         l.stroke,
-        l.h,
+        inner_h,
     );
 
     // A speaker slot in the forehead. This is most of what makes the glyph read as a handset
@@ -128,7 +141,7 @@ pub fn phone_icon(size: u32, attached: bool) -> Icon {
             size,
             colour,
             l.x + (l.w - slot_w) / 2,
-            l.y + l.stroke + (forehead - l.stroke) / 2,
+            l.y + l.stroke + (forehead - l.stroke).div_ceil(2),
             slot_w,
             l.stroke,
         );
@@ -263,7 +276,7 @@ mod tests {
             let l = layout(size);
             let on = phone_icon(size, true);
             let off = phone_icon(size, false);
-            // Midway down the left wall, drawn in both states. Not a corner: those are clear now.
+            // Midway down the left wall, drawn in both states. Not a corner: those are clear.
             let (x, y) = (l.x, l.y + l.h / 2);
             assert_eq!(pixel(&on, x, y), [0xFF, 0x2F, 0xA8, 0x5A], "size {size}");
             assert_eq!(pixel(&off, x, y), [0xFF, 0x8A, 0x8A, 0x8E], "size {size}");
@@ -271,9 +284,26 @@ mod tests {
     }
 
     #[test]
-    fn drawing_is_deterministic() {
+    fn the_four_corners_of_the_case_are_clear() {
+        // What makes it read as a rounded case rather than a box. Nothing asserted this before,
+        // and the first version's comment claimed the corners were clear while the side bars
+        // painted them.
         for &size in &SIZES {
-            assert_eq!(phone_icon(size, true).data, phone_icon(size, true).data);
+            for attached in [true, false] {
+                let icon = phone_icon(size, attached);
+                let l = layout(size);
+                for (cx, cy) in [
+                    (l.x, l.y),
+                    (l.x + l.w - 1, l.y),
+                    (l.x, l.y + l.h - 1),
+                    (l.x + l.w - 1, l.y + l.h - 1),
+                ] {
+                    assert!(
+                        !opaque(&icon, cx, cy),
+                        "size {size}: corner ({cx},{cy}) is painted"
+                    );
+                }
+            }
         }
     }
 

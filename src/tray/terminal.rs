@@ -85,16 +85,16 @@ pub fn size_args(program: &str, cols: u16, rows: u16) -> Vec<String> {
         // behind it can be sized at all. Otherwise this would hand `x-terminal-emulator` a size it
         // silently discards, and step 3 would then prefer an unsizable GNOME Terminal over an
         // installed, sizable kitty.
-        return match row_size_args(target, cols, rows).is_empty() {
-            true => Vec::new(),
-            false => vec!["-geometry".into(), format!("{cols}x{rows}")],
+        return if row_size_args(target, cols, rows).is_empty() {
+            Vec::new()
+        } else {
+            vec!["-geometry".into(), format!("{cols}x{rows}")]
         };
     }
     row_size_args(basename(program), cols, rows)
 }
 
 fn row_size_args(name: &str, cols: u16, rows: u16) -> Vec<String> {
-    let arg = |s: String| s;
     match name {
         // remember_window_size defaults to yes and then *overrides* initial_window_*, so without
         // it kitty reopens at whatever size it was last dragged to.
@@ -102,29 +102,30 @@ fn row_size_args(name: &str, cols: u16, rows: u16) -> Vec<String> {
             "-o".into(),
             "remember_window_size=no".into(),
             "-o".into(),
-            arg(format!("initial_window_width={cols}c")),
+            (format!("initial_window_width={cols}c")),
             "-o".into(),
-            arg(format!("initial_window_height={rows}c")),
+            (format!("initial_window_height={rows}c")),
         ],
         "alacritty" => vec![
             "-o".into(),
-            arg(format!("window.dimensions.columns={cols}")),
+            (format!("window.dimensions.columns={cols}")),
             "-o".into(),
-            arg(format!("window.dimensions.lines={rows}")),
+            (format!("window.dimensions.lines={rows}")),
         ],
-        "foot" => vec![arg(format!("--window-size-chars={cols}x{rows}"))],
-        "xfce4-terminal" => vec![arg(format!("--geometry={cols}x{rows}"))],
+        "foot" => vec![(format!("--window-size-chars={cols}x{rows}"))],
+        "xfce4-terminal" => vec![(format!("--geometry={cols}x{rows}"))],
         "konsole" => vec![
             "-p".into(),
-            arg(format!("TerminalColumns={cols}")),
+            (format!("TerminalColumns={cols}")),
             "-p".into(),
-            arg(format!("TerminalRows={rows}")),
+            (format!("TerminalRows={rows}")),
         ],
-        "xterm" => vec!["-geometry".into(), arg(format!("{cols}x{rows}"))],
-        // GNOME Terminal is in this list on purpose, with nothing in it. --geometry has been
-        // deprecated since 3.28 and is ignored by 3.56; worse, the client hands off to the server
-        // and exits 0 at once, so a bad size would produce a small window, no error, and
-        // "terminal too small" — the very defect this module exists to fix, surviving its own fix.
+        "xterm" => vec!["-geometry".into(), (format!("{cols}x{rows}"))],
+        // GNOME Terminal takes --geometry too. A plan review reported it "deprecated since 3.28
+        // and ignored", and that was carried for two plan revisions before anyone ran it: on
+        // 3.56.2 here, --geometry=97x41 gives a 97x41 window and --geometry=63x21 a 63x21 one,
+        // against a 80x24 default. Deprecated it may be; ignored it is not.
+        "gnome-terminal" => vec![(format!("--geometry={cols}x{rows}"))],
         _ => Vec::new(),
     }
 }
@@ -685,19 +686,30 @@ mod tests {
     }
 
     #[test]
-    fn gnome_terminal_is_asked_for_no_size_at_all() {
-        // --geometry has been deprecated since 3.28 and is ignored by 3.56. Worse, the client
-        // hands off to the server and exits 0 at once, so a bad size would give a small window,
-        // no error, and "terminal too small" - the defect this module exists to fix.
-        assert!(size_args("gnome-terminal", 80, 32).is_empty());
-        assert_eq!(separator("gnome-terminal"), Some("--"));
+    fn gnome_terminal_takes_a_geometry_and_a_double_dash() {
+        // `--` rather than `-e`, which is deprecated there and warns. The geometry is measured on
+        // the real binary, not assumed: see the comment on the row.
         assert_eq!(
             argv(
                 &Candidate::plain("gnome-terminal"),
                 Path::new("/x/wadb"),
-                &[]
+                &size_args("gnome-terminal", 80, 32),
             ),
-            vec!["gnome-terminal", "--", "/x/wadb"]
+            vec!["gnome-terminal", "--geometry=80x32", "--", "/x/wadb"]
+        );
+    }
+
+    #[test]
+    fn xfce4_terminal_takes_its_own_geometry_and_x() {
+        // The third row that can actually be run on this machine, so it is pinned like the other
+        // two. `-x` rather than `-e`: `-e` there takes a single string, `-x` takes the rest.
+        assert_eq!(
+            argv(
+                &Candidate::plain("xfce4-terminal"),
+                Path::new("/x/wadb"),
+                &size_args("xfce4-terminal", 80, 32),
+            ),
+            vec!["xfce4-terminal", "--geometry=80x32", "-x", "/x/wadb"]
         );
     }
 
@@ -726,12 +738,14 @@ mod tests {
 
     #[test]
     fn a_wrapper_is_sized_only_when_its_target_can_be() {
-        // The distinction that keeps step 3 honest. xfce4-terminal takes a size, so its wrapper is
-        // worth sizing and a deliberate alternative pointing at it is honoured. GNOME Terminal has
-        // ignored --geometry since 3.28, so its wrapper translates faithfully into something
-        // discarded - and sizing it would make step 3 prefer an unsizable terminal over kitty.
+        // The distinction that keeps step 3 honest: a wrapper is worth sizing exactly when the
+        // terminal behind it takes a size. Both Debian wrappers here do, so an alternative
+        // pointing at either is honoured. A wrapper around something wadb has no row for is not
+        // sized, and step 3 then declines it rather than preferring it over an installed kitty.
         assert!(!size_args("xfce4-terminal.wrapper", 80, 32).is_empty());
-        assert!(size_args("gnome-terminal.wrapper", 80, 32).is_empty());
+        assert!(!size_args("gnome-terminal.wrapper", 80, 32).is_empty());
+        assert!(size_args("ptyxis.wrapper", 80, 32).is_empty());
+        assert_eq!(separator("ptyxis.wrapper"), Some("-e"));
     }
 
     #[test]
@@ -847,7 +861,7 @@ mod tests {
         }
 
         fn program(&self, name: &str) -> &Self {
-            script(&self.bin.join(name), "exec /bin/sleep 5");
+            script(&self.bin.join(name), "exec /bin/sleep 2");
             self
         }
 
@@ -953,6 +967,40 @@ mod tests {
         assert_eq!(f.chosen().first().map(String::as_str), Some("kitty"));
     }
 
+    /// Put a fake `x-terminal-emulator` on the fixture PATH, pointing at `target` the way
+    /// update-alternatives does: a symlink, so the code has to resolve and canonicalise it.
+    fn alternative_to(f: &Fixture, target: &str) {
+        script(&f.bin.join(target), "exec /bin/sleep 2");
+        std::os::unix::fs::symlink(f.bin.join(target), f.bin.join("x-terminal-emulator")).unwrap();
+    }
+
+    #[test]
+    fn a_sizable_alternative_is_honoured_before_the_known_list() {
+        // Step 3, which is the original defect in miniature: an administrator's deliberate choice
+        // losing to whatever wadb happens to know about. Nothing pinned this, so a one-line change
+        // to the predicate would have passed CI.
+        let mut env = EnvGuard::lock();
+        let f = Fixture::new("alt-sizable", &mut env);
+        f.program("kitty");
+        alternative_to(&f, "xfce4-terminal.wrapper");
+        let first = f.chosen().first().cloned().unwrap_or_default();
+        assert!(
+            first.ends_with("xfce4-terminal.wrapper"),
+            "a sizable alternative must beat the known list, got {first}"
+        );
+    }
+
+    #[test]
+    fn an_unsizable_alternative_falls_through_to_the_known_list() {
+        // The other half. Honouring an alternative wadb cannot size would mean opening a terminal
+        // that shows "terminal too small" in preference to one that does not.
+        let mut env = EnvGuard::lock();
+        let f = Fixture::new("alt-unsizable", &mut env);
+        f.program("kitty");
+        alternative_to(&f, "ptyxis");
+        assert_eq!(f.chosen().first().map(String::as_str), Some("kitty"));
+    }
+
     #[test]
     fn terminal_beats_everything_the_desktop_recorded() {
         let mut env = EnvGuard::lock();
@@ -974,7 +1022,7 @@ mod tests {
         script(
             &f.bin.join("kitty"),
             &format!(
-                "echo \"$*\" >> {log}\ncase \"$1\" in -o) exit 1 ;; esac\nexec /bin/sleep 5",
+                "echo \"$*\" >> {log}\ncase \"$1\" in -o) exit 1 ;; esac\nexec /bin/sleep 2",
                 log = log.display()
             ),
         );

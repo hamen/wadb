@@ -143,9 +143,9 @@ Debian-family machine it is usually GNOME Terminal by package priority, whatever
 installed, which is why it is not tried first.
 
 The size is a request. A tiling window manager ignores it, and so does any terminal not in the
-list above — the "terminal too small" screen is the backstop. **GNOME Terminal cannot be sized from
-the command line at all**: `--geometry` has been deprecated since 3.28 and is ignored, so if that
-is your terminal, raise the size in its profile or point `$TERMINAL` somewhere else.
+list above — the "terminal too small" screen is the backstop. If a terminal rejects the size
+arguments outright, wadb notices it exit and opens it again without them, so a wrong guess costs
+the size and never the window.
 
 Until `wadb install` has run, the icon stays offline and the menu says so: the tray reads nothing
 from a port that is not ours. To start it with your session, add `wadb tray` to your desktop's
