@@ -820,13 +820,9 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
     /// Output fixtures cannot catch the defect that matters here: a probe aimed at the
     /// wrong port, or one that leaves its server running to win the bind race against the
     /// real unit.
-    /// Serialises the tests that poison the process environment: `set_var` is visible to
-    /// every other test running in parallel.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn probe_spawns_aims_and_tears_down() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = crate::test_support::EnvGuard::lock();
         let dir = std::env::temp_dir().join(format!("wadb-probe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("calls.log");
@@ -847,12 +843,10 @@ emulator-5554          device product:sdk model:Android_SDK transport_id:4
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
 
-        // Poison the environment the probe must not propagate.
-        std::env::set_var("ADB_SERVER_SOCKET", "tcp:127.0.0.1:9999");
-        std::env::set_var("ANDROID_ADB_SERVER_PORT", "9999");
+        // Poison the environment the probe must not propagate. The guard restores it.
+        env.set("ADB_SERVER_SOCKET", "tcp:127.0.0.1:9999");
+        env.set("ANDROID_ADB_SERVER_PORT", "9999");
         let result = probe_mdns_support(&fake).unwrap();
-        std::env::remove_var("ADB_SERVER_SOCKET");
-        std::env::remove_var("ANDROID_ADB_SERVER_PORT");
         assert_eq!(
             result,
             MdnsSupport::Present("mdns daemon version [Openscreen discovery 0.0.0]".into())

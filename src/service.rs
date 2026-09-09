@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::adb::{self, MdnsSupport, SmartSocket, DEFAULT_PORT};
 
@@ -495,6 +495,76 @@ pub fn port_owner(port: u16) -> PortOwner {
     )
 }
 
+/// `port_owner` for a caller that has already asked `is-active` this cycle, so the tray's refresh
+/// does not run it twice.
+pub fn port_owner_given(port: u16, active: bool) -> PortOwner {
+    classify_owner(
+        SmartSocket::new(port).is_up(),
+        listener_pid(port),
+        main_pid().filter(|_| active),
+    )
+}
+
+/// Ask a foreign server to stop so the unit can take the port, then wait for it to. Shared by
+/// `wadb takeover` and the tray; the lines returned are what the CLI prints.
+pub fn takeover(adb: &Path, port: u16) -> Result<Vec<String>> {
+    takeover_given(adb, port, port_owner(port), installed_unit().is_some())
+}
+
+/// The takeover sequence with its inputs passed in, so a test can reach `kill-server` without a
+/// live port owner.
+pub fn takeover_given(
+    adb: &Path,
+    port: u16,
+    owner: PortOwner,
+    unit_installed: bool,
+) -> Result<Vec<String>> {
+    match owner {
+        PortOwner::Ours(pid) => {
+            return Ok(vec![format!(
+                "port {port} is already ours (pid {pid}); nothing to do."
+            )])
+        }
+        PortOwner::Nobody => return Ok(vec![format!("nothing is holding port {port}.")]),
+        PortOwner::Foreign | PortOwner::HeldUnknown => {}
+    }
+
+    // A cooperative request, not a kill: we never signal a process we do not own.
+    // The socket is pinned explicitly, or an inherited ADB_SERVER_SOCKET could send this
+    // to a different server than the one we just checked.
+    let out = Command::new(adb)
+        .env("ADB_SERVER_SOCKET", format!("tcp:127.0.0.1:{port}"))
+        .env_remove("ANDROID_ADB_SERVER_PORT")
+        .arg("kill-server")
+        .output()
+        .with_context(|| format!("could not run {}", adb.display()))?;
+    if !out.status.success() {
+        bail!(
+            "adb kill-server failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let mut lines = vec!["asked the foreign server to stop.".to_string()];
+
+    if unit_installed {
+        // Not a bare `?`. By this point the foreign server has already been stopped, and losing
+        // that half of the story leaves the caller reporting only that the restart failed - so a
+        // user reads "restarting the unit failed" and does not learn that nothing is on the port
+        // any more. The CLI used to print the first line before attempting the restart; returning
+        // the lines at the end means this path has to carry both facts itself.
+        restart().map_err(|e| {
+            anyhow!("asked the foreign server to stop, but restarting the unit failed: {e:#}")
+        })?;
+        match wait_for_ownership(port, std::time::Duration::from_secs(5)) {
+            PortOwner::Ours(pid) => {
+                lines.push(format!("the unit now owns port {port}, pid {pid}."))
+            }
+            _ => lines.push("restarted the unit, but it has not taken the port yet.".to_string()),
+        }
+    }
+    Ok(lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,6 +787,65 @@ mod tests {
         // Unreadable owner must never be reported as ours.
         assert_eq!(classify_owner(true, None, Some(42)), PortOwner::HeldUnknown);
         assert_eq!(classify_owner(false, None, None), PortOwner::Nobody);
+    }
+
+    /// A fake adb that logs what it was asked and how, then exits as told.
+    fn fake_adb(dir: &Path, name: &str, log: &Path, exit: u8) -> PathBuf {
+        let fake = dir.join(name);
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"argv: $* | socket=${{ADB_SERVER_SOCKET:-unset}} | port_env=${{ANDROID_ADB_SERVER_PORT:-unset}}\" >> {log}\n\
+                 echo 'cannot connect to daemon' >&2\n\
+                 exit {exit}\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        fake
+    }
+
+    #[test]
+    fn takeover_asks_the_foreign_server_to_stop_over_a_pinned_socket() {
+        let mut env = crate::test_support::EnvGuard::lock();
+        // Set in the parent so that "absent in the child" proves `env_remove`, not an
+        // empty parent.
+        env.set("ANDROID_ADB_SERVER_PORT", "1");
+        let dir = std::env::temp_dir().join(format!("wadb-takeover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("calls.log");
+        let ok = fake_adb(&dir, "adb-ok", &log, 0);
+        let failing = fake_adb(&dir, "adb-fail", &log, 1);
+
+        // Ours and Nobody answer without running adb at all.
+        let lines = takeover_given(&ok, 5137, PortOwner::Ours(42), true).unwrap();
+        assert_eq!(
+            lines,
+            vec!["port 5137 is already ours (pid 42); nothing to do."]
+        );
+        let lines = takeover_given(&ok, 5137, PortOwner::Nobody, true).unwrap();
+        assert_eq!(lines, vec!["nothing is holding port 5137."]);
+        assert!(!log.exists(), "no owner to ask, so adb must not run");
+
+        // Foreign, no unit: exactly one line, and nothing touches systemctl.
+        let lines = takeover_given(&ok, 5137, PortOwner::Foreign, false).unwrap();
+        assert_eq!(lines, vec!["asked the foreign server to stop."]);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls.lines().count(), 1, "{calls}");
+        assert!(calls.contains("argv: kill-server |"), "{calls}");
+        assert!(calls.contains("socket=tcp:127.0.0.1:5137"), "{calls}");
+        assert!(calls.contains("port_env=unset"), "{calls}");
+
+        // A failed kill-server is an error carrying adb's stderr.
+        let err = takeover_given(&failing, 5137, PortOwner::HeldUnknown, false)
+            .expect_err("a kill-server that exits 1 is a failure")
+            .to_string();
+        assert!(err.starts_with("adb kill-server failed:"), "{err}");
+        assert!(err.contains("cannot connect to daemon"), "{err}");
     }
 
     #[test]

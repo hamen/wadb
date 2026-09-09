@@ -21,6 +21,10 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 rand = "0.9"
 rpassword = "7"
 zeroize = "1"
+# The blocking API, on async-io rather than tokio: the rest of this crate is synchronous, and
+# ksni's default feature set pulls in a tokio runtime for what is a DBus object with a menu on it.
+# async-io is still a reactor, but a far smaller one, and nothing here awaits.
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 
 [profile.release]
 strip = true
